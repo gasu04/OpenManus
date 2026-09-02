@@ -1,8 +1,10 @@
 import time
+from typing import Optional
 
 from daytona import (
     CreateSandboxFromImageParams,
     Daytona,
+    DaytonaAuthenticationError,
     DaytonaConfig,
     Resources,
     Sandbox,
@@ -38,8 +40,24 @@ if daytona_config.target:
 else:
     logger.warning("No Daytona target found in environment variables")
 
-daytona = Daytona(daytona_config)
-logger.info("Daytona client initialized")
+# Construct the Daytona client lazily so importing this module never fails
+# when no Daytona credentials are configured. The client is only built on first
+# use (and raises a clear error then if credentials are still missing).
+daytona: Optional[Daytona] = None
+
+
+def _get_daytona_client() -> Daytona:
+    """Return the singleton Daytona client, creating it on first use."""
+    global daytona
+    if daytona is None:
+        if not daytona_config.api_key:
+            raise DaytonaAuthenticationError(
+                "Daytona sandbox is not configured. Set DAYTONA_API_KEY or "
+                "both DAYTONA_JWT_TOKEN and DAYTONA_ORGANIZATION_ID."
+            )
+        daytona = Daytona(daytona_config)
+        logger.info("Daytona client initialized")
+    return daytona
 
 
 async def get_or_start_sandbox(sandbox_id: str):
@@ -48,7 +66,8 @@ async def get_or_start_sandbox(sandbox_id: str):
     logger.info(f"Getting or starting sandbox with ID: {sandbox_id}")
 
     try:
-        sandbox = daytona.get(sandbox_id)
+        client = _get_daytona_client()
+        sandbox = client.get(sandbox_id)
 
         # Check if sandbox needs to be started
         if (
@@ -57,11 +76,11 @@ async def get_or_start_sandbox(sandbox_id: str):
         ):
             logger.info(f"Sandbox is in {sandbox.state} state. Starting...")
             try:
-                daytona.start(sandbox)
+                client.start(sandbox)
                 # Wait a moment for the sandbox to initialize
                 # sleep(5)
                 # Refresh sandbox state after starting
-                sandbox = daytona.get(sandbox_id)
+                sandbox = client.get(sandbox_id)
 
                 # Start supervisord in a session when restarting
                 start_supervisord_session(sandbox)
@@ -73,7 +92,7 @@ async def get_or_start_sandbox(sandbox_id: str):
         return sandbox
 
     except Exception as e:
-        logger.error(f"Error retrieving or starting sandbox: {str(e)}")
+        logger.error(f"Error retrieving or starting sandbox with ID: {str(e)}")
         raise e
 
 
@@ -137,7 +156,8 @@ def create_sandbox(password: str, project_id: str = None):
     )
 
     # Create the sandbox
-    sandbox = daytona.create(params)
+    client = _get_daytona_client()
+    sandbox = client.create(params)
     logger.info(f"Sandbox created with ID: {sandbox.id}")
 
     # Start supervisord in a session for new sandbox
@@ -153,10 +173,11 @@ async def delete_sandbox(sandbox_id: str):
 
     try:
         # Get the sandbox
-        sandbox = daytona.get(sandbox_id)
+        client = _get_daytona_client()
+        sandbox = client.get(sandbox_id)
 
         # Delete the sandbox
-        daytona.delete(sandbox)
+        client.delete(sandbox)
 
         logger.info(f"Successfully deleted sandbox {sandbox_id}")
         return True

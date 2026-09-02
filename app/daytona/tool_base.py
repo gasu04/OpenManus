@@ -19,7 +19,24 @@ daytona_config = DaytonaConfig(
     server_url=daytona_settings.daytona_server_url,
     target=daytona_settings.daytona_target,
 )
-daytona = Daytona(daytona_config)
+# Construct the Daytona client lazily (see app.daytona.sandbox._get_daytona_client)
+# so importing this module never fails when Daytona is not configured.
+daytona: Optional[Daytona] = None
+
+
+def _get_daytona_client() -> Daytona:
+    """Return the singleton Daytona client, creating it on first use."""
+    global daytona
+    if daytona is None:
+        if not daytona_config.api_key:
+            from daytona import DaytonaAuthenticationError
+
+            raise DaytonaAuthenticationError(
+                "Daytona sandbox is not configured. Set DAYTONA_API_KEY or "
+                "both DAYTONA_JWT_TOKEN and DAYTONA_ORGANIZATION_ID."
+            )
+        daytona = Daytona(daytona_config)
+    return daytona
 
 
 @dataclass
@@ -103,7 +120,7 @@ class SandboxToolsBase(BaseTool):
             ):
                 logger.info(f"Sandbox is in {self._sandbox.state} state. Starting...")
                 try:
-                    daytona.start(self._sandbox)
+                    _get_daytona_client().start(self._sandbox)
                     # Wait a moment for the sandbox to initialize
                     # sleep(5)
                     # Refresh sandbox state after starting
