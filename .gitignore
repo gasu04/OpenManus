@@ -5,8 +5,13 @@ logs/
 # Data
 data/
 
-# Workspace
-workspace/
+# Workspace (keep the web UI; ignore runtime artifacts and secrets)
+workspace/*
+!workspace/webapp.py
+!workspace/run_webapp.sh
+!workspace/README_webapp.md
+!workspace/static/
+!workspace/static/**
 
 ### Python ###
 # Byte-compiled / optimized / DLL files

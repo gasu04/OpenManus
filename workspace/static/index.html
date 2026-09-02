@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenManus</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <symbol id="i-logo" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+      <symbol id="i-new" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+      <symbol id="i-send" viewBox="0 0 24 24"><path d="M12 19V5M5 12l7-7 7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1.5" fill="currentColor"/></symbol>
+      <symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 12h18M12 3c2.8 2.6 4 5.6 4 9s-1.2 6.4-4 9c-2.8-2.6-4-5.6-4-9s1.2-6.4 4-9z" fill="none" stroke="currentColor" stroke-width="1.8"/></symbol>
+      <symbol id="i-terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M7 9l3 3-3 3M12 15h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M14 3v4h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M9 12h6M9 16h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+      <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-x" viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+      <symbol id="i-bolt" viewBox="0 0 24 24"><path d="M13 2L5 13h6l-1 9 8-11h-6l1-9z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5l11 7-11 7z" fill="currentColor"/></symbol>
+      <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h6l2 3h10v11H3z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+      <symbol id="i-zoom-in" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.5-4.5M8 11h6M11 8v6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+      <symbol id="i-zoom-out" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="2"/><path d="M21 21l-4.5-4.5M8 11h6" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+      <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h.01a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h.01a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v.01a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+      <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16M9 7V5h6v2M6 7l1 13h10l1-13M10 11v6M14 11v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-edit" viewBox="0 0 24 24"><path d="M4 20h4L19 9l-4-4L4 16v4zM13 7l4 4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></symbol>
+      <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 4v11M7 11l5 5 5-5M5 20h14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-cloud" viewBox="0 0 24 24"><path d="M7 18a4.5 4.5 0 1 1 .7-8.95A6 6 0 0 1 19 10.5 4 4 0 0 1 18 18H7z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 12v5M9.5 14.5L12 17l2.5-2.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-history" viewBox="0 0 24 24"><path d="M3.5 12a8.5 8.5 0 1 0 2.49-6.01M3.5 4v5h5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/><path d="M12 8v4.5l3 1.8" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
+    </defs>
+  </svg>
+
+  <div class="app">
+    <!-- Left: chat panel -->
+    <aside class="chat-panel" id="chatPanel">
+      <header class="chat-header">
+        <div class="brand">
+          <svg class="brand-logo"><use href="#i-logo"/></svg>
+          <span class="brand-name">OpenManus</span>
+          <button class="model-chip" id="modelChip" title="Change model">
+            <span class="model-chip-dot"></span><span id="modelChipName">...</span>
+          </button>
+        </div>
+        <div class="header-actions">
+          <button class="btn-icon" id="btnHistory" title="Past tasks">
+            <svg class="ic"><use href="#i-history"/></svg>
+          </button>
+          <button class="btn-icon" id="btnSettings" title="Model settings">
+            <svg class="ic"><use href="#i-gear"/></svg>
+          </button>
+          <button class="btn-new" id="btnNew" title="New task">
+            <svg class="ic"><use href="#i-new"/></svg>
+            <span>New</span>
+          </button>
+        </div>
+      </header>
+
+      <div class="history-drawer hidden" id="historyDrawer">
+        <header class="history-head">
+          <span>Past tasks</span>
+          <button class="btn-icon" id="historyClose" title="Close"><svg class="ic"><use href="#i-x"/></svg></button>
+        </header>
+        <div class="history-list" id="historyList">
+          <div class="pane-empty">No past tasks yet.</div>
+        </div>
+      </div>
+
+      <div class="messages" id="messages">
+        <div class="welcome" id="welcome">
+          <svg class="welcome-logo"><use href="#i-logo"/></svg>
+          <h1>Hi, I'm OpenManus.</h1>
+          <p>What can I do for you? I can browse the web, run code, and edit files — you'll see every step live in the panel on the right.</p>
+        </div>
+      </div>
+
+      <footer class="composer-wrap">
+        <div class="composer">
+          <textarea id="promptInput" rows="1" placeholder="Give Manus a task..."></textarea>
+          <button class="btn-send" id="btnSend" title="Send" disabled>
+            <svg class="ic"><use href="#i-send"/></svg>
+          </button>
+          <button class="btn-stop hidden" id="btnStop" title="Stop">
+            <svg class="ic"><use href="#i-stop"/></svg>
+          </button>
+        </div>
+        <div class="composer-hint">OpenManus may make mistakes. Review important information.</div>
+      </footer>
+    </aside>
+
+    <!-- Right: computer panel -->
+    <section class="computer-panel" id="computerPanel">
+      <header class="computer-header">
+        <div class="computer-title">
+          <span>OpenManus's Computer</span>
+          <span class="live-pill" id="livePill">
+            <span class="live-dot"></span><span id="liveLabel">Idle</span>
+          </span>
+        </div>
+        <div class="computer-stats">
+          <span id="stepStat" class="stat">Step 0/0</span>
+          <span class="stat-divider"></span>
+          <span id="elapsedStat" class="stat">0:00</span>
+        </div>
+      </header>
+
+      <nav class="tabs" id="tabs">
+        <button class="tab active" data-tab="live"><svg class="ic"><use href="#i-bolt"/></svg>Live</button>
+        <button class="tab" data-tab="browser"><svg class="ic"><use href="#i-globe"/></svg>Browser</button>
+        <button class="tab" data-tab="terminal"><svg class="ic"><use href="#i-terminal"/></svg>Terminal</button>
+        <button class="tab" data-tab="editor"><svg class="ic"><use href="#i-file"/></svg>Editor</button>
+        <button class="tab" data-tab="files"><svg class="ic"><use href="#i-download"/></svg>Files</button>
+      </nav>
+
+      <div class="tab-content">
+        <!-- Live timeline -->
+        <div class="pane active" id="pane-live">
+          <div class="timeline" id="timeline">
+            <div class="pane-empty">Activity from a run will appear here.</div>
+          </div>
+        </div>
+
+        <!-- Browser -->
+        <div class="pane" id="pane-browser">
+          <div class="browser-bar">
+            <span class="browser-url" id="browserUrl">No page loaded</span>
+            <div class="browser-zoom">
+              <button id="zoomOut" title="Zoom out"><svg class="ic"><use href="#i-zoom-out"/></svg></button>
+              <button id="zoomIn" title="Zoom in"><svg class="ic"><use href="#i-zoom-in"/></svg></button>
+            </div>
+          </div>
+          <div class="browser-viewport" id="browserViewport">
+            <div class="pane-empty" id="browserEmpty">The agent hasn't opened a browser page yet.</div>
+            <img id="browserShot" class="hidden" alt="Browser screenshot" />
+          </div>
+        </div>
+
+        <!-- Terminal -->
+        <div class="pane" id="pane-terminal">
+          <div class="terminal" id="terminal">
+            <div class="pane-empty">Python executions will appear here.</div>
+          </div>
+        </div>
+
+        <!-- Editor -->
+        <div class="pane" id="pane-editor">
+          <div class="editor-sidebar" id="editorSidebar"></div>
+          <div class="editor-main" id="editorMain">
+            <div class="pane-empty">Files the agent works on will appear here.</div>
+          </div>
+        </div>
+
+        <!-- Output files -->
+        <div class="pane" id="pane-files">
+          <div class="files-wrap">
+            <div class="files-toolbar">
+              <span class="files-title">Output files <span class="count-badge" id="filesCount"></span></span>
+              <button class="btn-ghost sm" id="btnRefreshOutputs" title="Refresh">
+                <svg class="ic"><use href="#i-refresh"/></svg>Refresh
+              </button>
+            </div>
+            <div class="gdrive-banner hidden" id="gdriveBanner">
+              <svg class="ic"><use href="#i-cloud"/></svg>
+              <span>Google Drive saving is not configured.</span>
+              <button class="linklike" id="gdriveHow">How to enable</button>
+            </div>
+            <div class="files-list" id="filesList">
+              <div class="pane-empty">Files the agent produces will appear here.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Model settings modal -->
+  <div class="modal-overlay hidden" id="modelModal">
+    <div class="modal">
+      <header class="modal-header">
+        <h2>Models</h2>
+        <button class="btn-icon" id="modalClose" title="Close"><svg class="ic"><use href="#i-x"/></svg></button>
+      </header>
+      <div class="modal-body">
+        <div class="model-list" id="modelList">
+          <div class="pane-empty">Loading models...</div>
+        </div>
+
+        <div class="form-head" id="formHead">Add a model</div>
+        <form id="modelForm">
+          <div class="form-row">
+            <select id="fPreset"></select>
+          </div>
+          <div class="form-grid">
+            <label>Label<input type="text" id="fLabel" placeholder="My model" required /></label>
+            <label>Model ID<input type="text" id="fModel" placeholder="gpt-4o" required /></label>
+            <label class="span2">Base URL<input type="text" id="fBaseUrl" placeholder="https://api.openai.com/v1" required /></label>
+            <label class="span2">API key<input type="password" id="fKey" placeholder="sk-..." autocomplete="off" /></label>
+            <label>Max tokens<input type="number" id="fMaxTokens" value="8192" min="256" max="131072" /></label>
+            <label>Temperature<input type="number" id="fTemp" value="0.0" min="0" max="2" step="0.1" /></label>
+          </div>
+          <div class="form-actions">
+            <span id="formMsg" class="form-msg"></span>
+            <button type="button" class="btn-ghost hidden" id="formCancel">Cancel edit</button>
+            <button type="submit" class="btn-primary" id="formSave">Save model</button>
+          </div>
+          <div class="form-note">Keys are stored in <code>workspace/webapp_models.json</code> (gitignored), shown only as a hint afterwards, and never logged.</div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
