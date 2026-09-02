@@ -748,6 +748,12 @@ async def set_active_model(payload: Dict[str, str], username: str = Depends(veri
             applied += 1
 
     llm = _active_llm()
+    for session in sessions.values():
+        if session.websocket is not None:
+            await session.send_event(
+                "control",
+                {"action": "model_switch", "actor": "operator", "model": llm.model},
+            )
     return JSONResponse({"status": "ok", "active": model_id, "model": llm.model, "agents_updated": applied})
 
 
@@ -840,6 +846,19 @@ class AgentSession:
             self._instrument(self.agent)
         return self.agent
 
+    @staticmethod
+    def _read_token_counters(agent: Manus) -> tuple:
+        """Best-effort read of the agent LLM's cumulative token counters.
+
+        Returns:
+            (input_tokens, output_tokens), or (None, None) if unavailable.
+        """
+        try:
+            llm = agent.llm
+            return int(llm.total_input_tokens), int(llm.total_completion_tokens)
+        except Exception:
+            return None, None
+
     def _instrument(self, agent: Manus) -> None:
         """Wrap think/step/execute_tool as instance attributes to emit events."""
         orig_think = agent.think
@@ -848,6 +867,7 @@ class AgentSession:
 
         async def wrapped_think() -> bool:
             prev_count = len(agent.messages)
+            prev_in, prev_out = self._read_token_counters(agent)
             result = await orig_think()
             for msg in agent.messages[prev_count:]:
                 if msg.role == "assistant":
@@ -858,6 +878,20 @@ class AgentSession:
                             "plan",
                             {"tool": tc.function.name},
                         )
+            # Cost/usage metrics: token deltas for this think() call. LLM
+            # singletons accumulate counters; guard for counter swaps when the
+            # active model is switched mid-run.
+            cur_in, cur_out = self._read_token_counters(agent)
+            if cur_in is not None:
+                await self.send_event(
+                    "usage",
+                    {
+                        "delta_in": max(0, cur_in - (prev_in or 0)),
+                        "delta_out": max(0, cur_out - (prev_out or 0)),
+                        "total_in": cur_in,
+                        "total_out": cur_out,
+                    },
+                )
             return result
 
         async def wrapped_step() -> str:
@@ -1048,6 +1082,9 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 else:
                     session._task = asyncio.create_task(session.run_agent(prompt))
             elif kind == "stop":
+                await session.send_event(
+                    "control", {"action": "stop", "actor": "operator"}
+                )
                 await session.stop()
             elif kind == "human_reply":
                 await session.resolve_human_reply(message.get("content", ""))

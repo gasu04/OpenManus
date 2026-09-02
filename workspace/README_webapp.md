@@ -8,17 +8,29 @@ real time.
 
 - **Chat panel** — user messages, agent thoughts (collapsible), tool activity
   cards with live status and duration, markdown-rendered final answers.
-- **Live timeline** — every step of the run as it happens, newest at bottom.
+- **Live timeline** — every step of the run as it happens, newest at bottom,
+  ending with an end-of-run report (completed / stopped / failed with action,
+  step, and duration stats). A **Retry** button appears on failed/stopped
+  runs to resend the same prompt. Each tool call expands into a **tool-call
+  inspector** (chevron button): status, duration, and the full arguments and
+  result as pretty-printed, copyable JSON — not a truncated one-liner. A
+  filter box narrows the timeline to matching text.
 - **Browser pane** — live screenshots of the agent's browser session with URL
   bar and zoom controls.
 - **Terminal pane** — each `python_execute` call rendered as a terminal block
   (code + output, errors in red).
 - **Editor pane** — workspace file tree plus a code viewer with line numbers
   that auto-opens files as the agent edits them.
-- **Files pane** — every output file the agent produces (webapp runtime files
-  excluded), with type icons, size/date, a "New" badge for files touched in
-  the current session, one-click **download**, and optional **Save to
-  Google Drive**.
+- **Files pane** — a clean list of every output file the agent produces
+  (webapp runtime files excluded), with type icons, size/date, and one-click
+  **download**. The list refreshes automatically whenever you switch to the
+  tab. (Drive-upload APIs exist server-side but are not surfaced in the UI.)
+- **Copy-to-clipboard** on every error message, tool-call field, terminal
+  code block, and final answer. Errors and background failures always surface
+  as a visible toast (never silent — see `UI_ENGAGEMENT.md`).
+- **Filters** — a search box on the task-history drawer and one on the Live
+  timeline narrow long lists to matching text (client-side over what's
+  already loaded; not a full server-side search index).
 - **Ask-human bridge** — when the agent calls `ask_human`, the question
   appears in chat with an inline reply box instead of blocking the server.
 - **Model management** — gear icon (or the model chip in the header) opens a

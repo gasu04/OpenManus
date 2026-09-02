@@ -16,7 +16,14 @@
     step: { current: 0, max: 0 },
     startedAt: null,
     timer: null,
-    toolCards: new Map(), // event id -> {chatEl, tlEl}
+    toolCards: new Map(), // event id -> timeline element
+    activityPill: null,   // single chat activity pill (replaces per-tool cards)
+    actionCount: 0,
+    runOutcome: "",       // completed | stopped | failed | ended (for Live report)
+    submitPending: false, // run request sent, run_start echo not yet received
+    lastPrompt: "",       // most recent submitted prompt, for the Retry action
+    tokens: { in: 0, out: 0 },        // cumulative per session (server truth)
+    runTokens: { in: 0, out: 0 },     // deltas for the current run
     files: new Map(),     // path -> content cache
     activeFile: null,
     filesDirty: true,
@@ -24,12 +31,117 @@
     intentionalClose: false,
     zoom: 1,
   };
+  // Deep-link support: #s=<sessionId> wins over stored session (shareable URL).
+  const hashSession = (location.hash.match(/^#s=([\w-]+)$/) || [])[1];
+  if (hashSession) state.sessionId = hashSession;
   sessionStorage.setItem("openmanus_sid", state.sessionId);
 
   const $ = (id) => document.getElementById(id);
   const messages = $("messages");
   const timeline = $("timeline");
   const terminal = $("terminal");
+
+  // Bounded rendering: nothing in the DOM may grow without limit (P1-2).
+  const TIMELINE_MAX = 400;
+  const TERMINAL_MAX = 150;
+  const prunedCounts = new Map();
+
+  // Tool-call inspector data, keyed by call id (P1-8). Bounded by pruning below —
+  // entries are dropped the moment their timeline row is pruned, so this never
+  // outlives what's actually rendered.
+  const toolCallData = new Map();
+
+  function pruneContainer(el, max, onRemove) {
+    const n = pruneCount(el, max);
+    if (!n) return;
+    for (let i = 0; i < n; i++) {
+      const removed = el.firstElementChild;
+      if (!removed) break;
+      removed.remove();
+      onRemove?.(removed);
+      // an expanded inspector panel belonging to the row just removed would
+      // otherwise become an orphaned first child — drop it too.
+      if (el.firstElementChild?.classList.contains("tl-inspector")) {
+        el.firstElementChild.remove();
+      }
+    }
+    prunedCounts.set(el, (prunedCounts.get(el) || 0) + n);
+    let notice = el.querySelector("[data-prune-notice]");
+    if (!notice) {
+      notice = document.createElement("div");
+      notice.dataset.pruneNotice = "1";
+      notice.className = "prune-notice";
+      el.prepend(notice);
+    }
+    notice.textContent = `… ${prunedCounts.get(el).toLocaleString()} earlier entries pruned to keep the tab responsive`;
+  }
+
+  // ---------------------------------------------------- toast / clipboard
+  // Non-blocking status/error surface (P0-3, P1-9). Doubles as the local
+  // stand-in for a monitoring sink: no Sentry is configured in this
+  // deployment, so client errors are tagged + logged to console and
+  // surfaced here instead of failing silently.
+  function showToast(msg, kind = "info", ms = 4000) {
+    const root = $("toastRoot");
+    if (!root) return;
+    const el = document.createElement("div");
+    el.className = `toast ${kind}`;
+    el.setAttribute("role", kind === "error" ? "alert" : "status");
+    el.textContent = msg;
+    root.appendChild(el);
+    requestAnimationFrame(() => el.classList.add("show"));
+    setTimeout(() => {
+      el.classList.remove("show");
+      setTimeout(() => el.remove(), 200);
+    }, ms);
+  }
+
+  async function copyToClipboard(text, btnEl) {
+    try {
+      await navigator.clipboard.writeText(text);
+      showToast("Copied to clipboard", "info", 1500);
+      if (btnEl) {
+        btnEl.classList.add("copied");
+        setTimeout(() => btnEl.classList.remove("copied"), 1000);
+      }
+    } catch {
+      showToast("Copy failed — clipboard permission blocked", "error");
+    }
+  }
+
+  function copyBtnHtml(idx, label) {
+    return `<button class="copy-btn" data-copy-idx="${idx}" aria-label="Copy ${esc(label)}" title="Copy">${icon("i-copy")}</button>`;
+  }
+
+  function wireCopyButtons(root, texts) {
+    root.querySelectorAll(".copy-btn[data-copy-idx]").forEach((btn) => {
+      const idx = Number(btn.dataset.copyIdx);
+      btn.onclick = () => copyToClipboard(texts[idx], btn);
+    });
+  }
+
+  // Global safety net (P0-3): a broken click handler or rejected promise
+  // anywhere must never fail silently. No external monitoring sink is wired
+  // up in this local deployment — this is the honest equivalent (console tag
+  // + on-screen toast) rather than a real ingestion pipeline.
+  window.addEventListener("error", (e) => {
+    console.error("[client-error]", {
+      session: state.sessionId,
+      route: state.activeTab,
+      message: e.message,
+      source: e.filename,
+      line: e.lineno,
+    });
+    showToast("Something went wrong in the UI — see console for details.", "error");
+  });
+  window.addEventListener("unhandledrejection", (e) => {
+    console.error("[client-error:unhandled-rejection]", {
+      session: state.sessionId,
+      route: state.activeTab,
+      reason: String(e.reason),
+    });
+    showToast("A background action failed unexpectedly — see console for details.", "error");
+  });
 
   // ------------------------------------------------------------- utils
   const esc = (s) =>
@@ -131,12 +243,30 @@
   // ---------------------------------------------------------- chat items
   function clearWelcome() { $("welcome")?.remove(); }
 
+  // Long prompts render clamped with a toggle so they don't flood the chat.
   function addUserMessage(text) {
     clearWelcome();
     const el = document.createElement("div");
     el.className = "msg-user";
-    el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+    const bubble = document.createElement("div");
+    bubble.className = "bubble";
+    bubble.textContent = text;
+    if (text.length > 400) {
+      bubble.classList.add("clamped");
+      const toggle = document.createElement("button");
+      toggle.className = "bubble-toggle";
+      toggle.textContent = "Show more";
+      toggle.onclick = () => {
+        const clamped = bubble.classList.toggle("clamped");
+        toggle.textContent = clamped ? "Show more" : "Show less";
+      };
+      el.appendChild(bubble);
+      el.appendChild(toggle);
+    } else {
+      el.appendChild(bubble);
+    }
     messages.appendChild(el);
+    keepPillLast();
     scrollDown(messages);
   }
 
@@ -146,24 +276,47 @@
     el.className = "thought";
     el.innerHTML = `<summary>Thought</summary><div class="thought-body">${esc(content)}</div>`;
     messages.appendChild(el);
+    keepPillLast();
     scrollDown(messages);
   }
 
+  // Raw/rendered toggle + copy (P2-6: Output/artifact viewer rule).
   function addFinal(content) {
     clearWelcome();
     const el = document.createElement("div");
     el.className = "final";
-    el.innerHTML = markdown(content);
+    el.innerHTML = `
+      <div class="final-toolbar">
+        <button class="final-toggle" data-mode="rendered">View raw</button>
+        ${copyBtnHtml(0, "final answer")}
+      </div>
+      <div class="final-rendered">${markdown(content)}</div>
+      <pre class="final-raw hidden"></pre>`;
+    el.querySelector(".final-raw").textContent = content; // textContent: no markdown/HTML re-parsing
+    el.querySelector(".final-toggle").onclick = (e) => {
+      const btn = e.currentTarget;
+      const showingRendered = btn.dataset.mode === "rendered";
+      el.querySelector(".final-rendered").classList.toggle("hidden", showingRendered);
+      el.querySelector(".final-raw").classList.toggle("hidden", !showingRendered);
+      btn.dataset.mode = showingRendered ? "raw" : "rendered";
+      btn.textContent = showingRendered ? "View rendered" : "View raw";
+    };
+    wireCopyButtons(el, [content]);
     messages.appendChild(el);
+    keepPillLast();
     scrollDown(messages);
   }
 
+  // Copy-to-clipboard on every error message (P1-9 / §6 mandatory rule).
   function addError(msg) {
     clearWelcome();
     const el = document.createElement("div");
     el.className = "error-banner";
-    el.textContent = msg;
+    el.setAttribute("role", "alert"); // assertive: critical failure (§7)
+    el.innerHTML = `<span>${esc(msg)}</span>${copyBtnHtml(0, "error message")}`;
+    wireCopyButtons(el, [msg]);
     messages.appendChild(el);
+    keepPillLast();
     scrollDown(messages);
   }
 
@@ -189,29 +342,50 @@
     el.querySelector("button").onclick = submit;
     input.addEventListener("keydown", (e) => e.key === "Enter" && submit());
     messages.appendChild(el);
+    keepPillLast();
     input.focus();
     scrollDown(messages);
   }
 
-  function addToolCard(ev) {
+  // Single compact activity pill in chat (full detail lives in the Live
+  // timeline — no per-tool cards in both panes).
+  function keepPillLast() {
+    pruneContainer(messages, TIMELINE_MAX); // chat stays bounded across many runs
+    if (state.activityPill) messages.appendChild(state.activityPill);
+  }
+
+  function dropActivityPill() {
+    state.activityPill?.remove();
+    state.activityPill = null;
+  }
+
+  function updateActivityPill(ev) {
     clearWelcome();
     const ui = toolUI(ev.name, ev.category);
-    const el = document.createElement("div");
-    el.className = "tool-card";
-    el.dataset.cat = ui.cat;
-    el.innerHTML = `
-      <div class="tool-icon">${icon(ui.ic)}</div>
-      <div class="tool-body">
-        <div class="tool-title">${esc(ui.label)}</div>
-        <div class="tool-detail">${esc(toolDetail(ev.name, ev.arguments))}</div>
-      </div>
-      <div class="tool-status"><span class="spinner"></span></div>`;
-    el.onclick = () => switchTab(ui.cat === "browser" ? "browser"
-      : ui.cat === "terminal" ? "terminal"
-      : ui.cat === "editor" ? "editor" : "live", true);
-    messages.appendChild(el);
+    let pill = state.activityPill;
+    if (!pill) {
+      pill = document.createElement("div");
+      pill.className = "activity-pill";
+      pill.onclick = () => switchTab("live", true);
+      state.activityPill = pill;
+    }
+    pill.innerHTML = `
+      <span class="ap-icon">${icon(ui.ic)}</span>
+      <span class="ap-label">${esc(ui.label)}</span>
+      <span class="ap-detail">${esc(toolDetail(ev.name, ev.arguments))}</span>
+      <span class="ap-count">${state.actionCount || 1} actions</span>
+      <span class="ap-status"><span class="spinner"></span></span>`;
+    keepPillLast();
     scrollDown(messages);
-    return el;
+  }
+
+  function finalizeActivityPill(done) {
+    const pill = state.activityPill;
+    if (!pill) return;
+    pill.classList.add("done");
+    pill.querySelector(".ap-status").innerHTML = done ? icon("i-check") : icon("i-stop");
+    pill.querySelector(".ap-count").textContent =
+      `${state.actionCount} actions · ${fmtTime()} · view details`;
   }
 
   // -------------------------------------------------------- timeline
@@ -219,29 +393,143 @@
     const ui = toolUI(ev.name, ev.category);
     const empty = timeline.querySelector(".pane-empty");
     if (empty) empty.remove();
+    toolCallData.set(ev.id, { name: ev.name, category: ev.category, arguments: ev.arguments });
     const el = document.createElement("div");
-    el.className = "tl-item";
+    el.className = "tl-item tl-tool";
+    el.dataset.callId = ev.id;
     el.innerHTML = `
       <div class="tl-icon ${ui.cat}">${icon(ui.ic)}</div>
       <div class="tl-body">
         <div class="tl-title">${esc(ui.label)}</div>
         <div class="tl-detail">${esc(toolDetail(ev.name, ev.arguments))}</div>
       </div>
-      <div class="tl-time">${fmtTime()}</div>
-      <div class="tl-status"><span class="spinner"></span></div>`;
+      <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>
+      <div class="tl-status"><span class="spinner"></span></div>
+      <button class="tl-expand" aria-expanded="false" aria-label="Show tool call details">${icon("i-chevron")}</button>`;
+    el.querySelector(".tl-expand").onclick = () => toggleToolInspector(el);
     timeline.appendChild(el);
+    pruneContainer(timeline, TIMELINE_MAX, (removedEl) => {
+      if (removedEl.dataset?.callId) toolCallData.delete(removedEl.dataset.callId);
+    });
     scrollDown($("pane-live"));
     return el;
+  }
+
+  // Tool-call inspector (P1-8: mandatory §2 requirement — structured fields
+  // and a real JSON viewer, not a truncated one-line blob). Built lazily on
+  // expand and refreshed in place when tool_end delivers the result.
+  function toggleToolInspector(rowEl) {
+    const btn = rowEl.querySelector(".tl-expand");
+    const existing = rowEl.nextElementSibling;
+    if (existing?.classList.contains("tl-inspector")) {
+      existing.remove();
+      btn.setAttribute("aria-expanded", "false");
+      return;
+    }
+    const panel = buildToolInspector(rowEl.dataset.callId, toolCallData.get(rowEl.dataset.callId) || {});
+    rowEl.after(panel);
+    btn.setAttribute("aria-expanded", "true");
+  }
+
+  function refreshToolInspector(callId) {
+    const rowEl = timeline.querySelector(`.tl-tool[data-call-id="${CSS.escape(callId)}"]`);
+    const existing = rowEl?.nextElementSibling;
+    if (!existing?.classList.contains("tl-inspector")) return; // not expanded — nothing to refresh
+    existing.replaceWith(buildToolInspector(callId, toolCallData.get(callId) || {}));
+  }
+
+  function buildToolInspector(id, data) {
+    const el = document.createElement("div");
+    el.className = "tl-inspector";
+    const argsText = JSON.stringify(data.arguments ?? {}, null, 2);
+    const resultText = data.result != null ? data.result : "(pending — tool is still running)";
+    const statusLine = data.ok === undefined
+      ? "running"
+      : data.ok ? `succeeded in ${fmtDur(data.duration_ms)}` : `failed after ${fmtDur(data.duration_ms)}`;
+    el.innerHTML = `
+      <div class="ti-row"><span class="ti-label">call id</span><code class="ti-mono">${esc(id)}</code>${copyBtnHtml(0, "call id")}</div>
+      <div class="ti-row"><span class="ti-label">tool</span><code class="ti-mono">${esc(data.name || "")}</code></div>
+      <div class="ti-row"><span class="ti-label">status</span><span class="ti-status-${data.ok === undefined ? "pending" : data.ok ? "ok" : "err"}">${esc(statusLine)}</span></div>
+      <div class="ti-block">
+        <div class="ti-block-head"><span>Arguments</span>${copyBtnHtml(1, "arguments JSON")}</div>
+        <pre class="ti-json">${esc(argsText)}</pre>
+      </div>
+      <div class="ti-block">
+        <div class="ti-block-head"><span>Result${data.truncated ? ' <span class="ti-note">(truncated to 2000 chars by the server)</span>' : ""}</span>${copyBtnHtml(2, "result")}</div>
+        <pre class="ti-json">${esc(resultText)}</pre>
+      </div>`;
+    wireCopyButtons(el, [id, argsText, resultText]);
+    return el;
+  }
+
+  // End-of-run report entry in the Live timeline (success / stopped / failed).
+  function addRunReport() {
+    if (timeline.querySelector(".pane-empty")) timeline.innerHTML = "";
+    const outcome = state.runOutcome || "ended";
+    const tok = state.runTokens.in + state.runTokens.out > 0
+      ? ` · ${(state.runTokens.in + state.runTokens.out).toLocaleString()} tokens` : "";
+    const report = {
+      completed: { title: "Task completed", detail: `${state.actionCount} actions · ${state.step.current} steps · ${fmtTime()}${tok}`, cls: "ok", ic: "i-check" },
+      stopped: { title: "Task stopped by user", detail: `${state.actionCount} actions before stopping · ${fmtTime()}${tok}`, cls: "stopped", ic: "i-stop" },
+      failed: { title: "Task failed", detail: `Error during run · ${state.actionCount} actions · ${fmtTime()}`, cls: "err", ic: "i-x" },
+      ended: { title: "Run ended", detail: `${state.actionCount} actions · ${fmtTime()}${tok}`, cls: "", ic: "i-bolt" },
+    }[outcome];
+    const canRetry = (outcome === "failed" || outcome === "stopped") && state.lastPrompt;
+    const el = document.createElement("div");
+    el.className = `tl-item tl-report ${report.cls}`;
+    el.innerHTML = `
+      <div class="tl-icon ${report.cls}">
+        ${icon(report.ic)}
+      </div>
+      <div class="tl-body">
+        <div class="tl-title">${report.title}</div>
+        <div class="tl-detail">${esc(report.detail)}</div>
+      </div>
+      <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>
+      ${canRetry ? `<button class="tl-retry">${icon("i-refresh")} Retry</button>` : ""}`;
+    if (canRetry) el.querySelector(".tl-retry").onclick = retryLastRun;
+    timeline.appendChild(el);
+    pruneContainer(timeline, TIMELINE_MAX, (removedEl) => {
+      if (removedEl.dataset?.callId) toolCallData.delete(removedEl.dataset.callId);
+    });
+    scrollDown($("pane-live"));
+  }
+
+  // Retry action for the Error-surfacing rule (§2: "retry/resume action if
+  // applicable"). Re-submits the exact prompt that failed/was stopped.
+  function retryLastRun() {
+    const decision = composerDecision(
+      state.lastPrompt,
+      state.ws?.readyState === WebSocket.OPEN,
+      state.running,
+      state.submitPending
+    );
+    if (decision.action !== "send") {
+      showToast(`Can't retry right now (${decision.reason.replace(/-/g, " ")}).`, "error");
+      return;
+    }
+    if (!send({ type: "run", prompt: state.lastPrompt })) {
+      showToast("Retry failed to send — check the connection.", "error");
+      return;
+    }
+    state.submitPending = true;
+    syncSend();
   }
 
   // -------------------------------------------------------- tabs
   function switchTab(tab, userAction) {
     if (userAction) state.pinnedTab = true;
     state.activeTab = tab;
-    document.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t.dataset.tab === tab));
+    document.querySelectorAll(".tab").forEach((t) => {
+      const active = t.dataset.tab === tab;
+      t.classList.toggle("active", active);
+      t.setAttribute("aria-selected", String(active));
+      t.tabIndex = active ? 0 : -1;
+    });
     document.querySelectorAll(".pane").forEach((p) => p.classList.toggle("active", p.id === `pane-${tab}`));
-    if (tab === "editor" && state.filesDirty) refreshFiles();
-    if (tab === "files" && state.outputsDirty) loadOutputs();
+    if (tab === "live") scrollDown($("pane-live"));
+    if (tab === "editor") refreshFiles();   // always reload on switch
+    if (tab === "files") loadOutputs();     // always reload on switch
   }
 
   function autoSwitch(cat) {
@@ -272,20 +560,63 @@
     el.className = "term-block";
     el.innerHTML = `
       <div class="term-prompt"><span><span class="term-user">agent</span>@openmanus:~$</span><span>${fmtTime()}</span></div>
-      <div class="term-code">${esc(code)}</div>
+      <div class="term-code-row"><div class="term-code">${esc(code)}</div>${copyBtnHtml(0, "code")}</div>
       ${output ? `<div class="term-out ${ok ? "" : "err"}">${esc(output)}</div>` : ""}`;
+    wireCopyButtons(el, [code]);
     terminal.appendChild(el);
+    pruneContainer(terminal, TERMINAL_MAX);
     scrollDown(terminal);
     autoSwitch("terminal");
   }
 
   // -------------------------------------------------------- editor pane
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const MAX_FETCH_RETRIES = 2; // + the initial attempt = 3 tries total
+
+  // All fetches: 8s timeout, capped exponential-backoff retry on transient
+  // failures (network error / timeout / 5xx), explicit error state on
+  // exhaustion (no silent staleness — P1-5/P1-7). 4xx is not retried: retrying
+  // a client error can't succeed and would just duplicate the request.
+  async function fetchJson(url, opts = {}, attempt = 1) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    let res;
+    try {
+      res = await fetch(url, { ...opts, signal: ctrl.signal });
+    } catch (err) {
+      clearTimeout(t);
+      if (attempt <= MAX_FETCH_RETRIES) {
+        await sleep(backoffDelay(attempt));
+        return fetchJson(url, opts, attempt + 1);
+      }
+      throw err;
+    }
+    clearTimeout(t);
+    if (res.status >= 500 && attempt <= MAX_FETCH_RETRIES) {
+      await sleep(backoffDelay(attempt));
+      return fetchJson(url, opts, attempt + 1);
+    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  const errorRow = (msg, retry) => `
+    <div class="fetch-error" role="alert">
+      <span>${esc(msg)}</span>
+      <button class="btn-ghost sm" data-retry="${esc(String(retry))}">Retry</button>
+    </div>`;
+
+  function bindRetry(container, retryFn) {
+    container.querySelectorAll("[data-retry]")?.forEach((btn) => {
+      btn.onclick = () => retryFn();
+    });
+  }
+
   async function refreshFiles() {
     state.filesDirty = false;
+    const sidebar = $("editorSidebar");
     try {
-      const res = await fetch("/api/files");
-      const data = await res.json();
-      const sidebar = $("editorSidebar");
+      const data = await fetchJson("/api/files");
       const rows = [];
       const walk = (nodes, depth) => {
         for (const n of nodes) {
@@ -304,7 +635,10 @@
       sidebar.querySelectorAll('.file-row[data-kind="file"]').forEach((row) => {
         row.onclick = () => openFile(row.dataset.path, false);
       });
-    } catch { /* server unreachable; keep old listing */ }
+    } catch {
+      sidebar.innerHTML = errorRow("Could not load the workspace file tree.", "files");
+      bindRetry(sidebar, refreshFiles);
+    }
   }
 
   async function openFile(path, follow) {
@@ -361,17 +695,18 @@
 
   async function loadOutputs() {
     state.outputsDirty = false;
+    const list = $("filesList");
     try {
-      const res = await fetch(`/api/outputs?session=${encodeURIComponent(state.sessionId)}`);
-      const data = await res.json();
+      const data = await fetchJson(`/api/outputs?session=${encodeURIComponent(state.sessionId)}`);
       renderOutputs(data);
-    } catch { /* keep previous listing on transient errors */ }
+    } catch {
+      list.innerHTML = errorRow("Could not load output files.", "outputs");
+      bindRetry(list, loadOutputs);
+    }
   }
 
   function renderOutputs(data) {
     const list = $("filesList");
-    $("gdriveBanner").classList.toggle("hidden", !!data.gdrive?.enabled);
-    $("filesCount").textContent = data.files.length || "";
     if (!data.files.length) {
       list.innerHTML = `<div class="pane-empty">Files the agent produces will appear here.</div>`;
       return;
@@ -384,64 +719,17 @@
       row.innerHTML = `
         <div class="file-ic">${icon("i-file")}</div>
         <div class="file-body">
-          <div class="file-name"><span title="${esc(f.path)}">${esc(f.name)}</span>${f.touched ? '<span class="new-badge">New</span>' : ""}</div>
-          <div class="file-meta">${fmtSize(f.size)} · ${fmtDate(f.modified)} · ${esc(f.path)}</div>
+          <div class="file-name"><span title="${esc(f.path)}">${esc(f.name)}</span></div>
+          <div class="file-meta" title="${esc(absoluteTime(f.modified * 1000))}">${fmtSize(f.size)} · ${fmtDate(f.modified)}</div>
         </div>
         <div class="file-acts">
-          <span class="file-status-msg"></span>
           <a class="file-act" title="Download" href="/api/download?path=${encodeURIComponent(f.path)}" download>
             ${icon("i-download")}
           </a>
-          ${data.gdrive?.enabled ? `<button class="file-act gdrive" title="Save to Google Drive">${icon("i-cloud")}</button>` : ""}
         </div>`;
-      const gdriveBtn = row.querySelector(".gdrive");
-      if (gdriveBtn) gdriveBtn.onclick = () => uploadToGdrive(f, gdriveBtn, row.querySelector(".file-status-msg"));
       list.appendChild(row);
     }
   }
-
-  async function uploadToGdrive(file, btn, msgEl) {
-    btn.classList.add("busy");
-    msgEl.textContent = "Uploading to Drive...";
-    try {
-      const res = await fetch("/api/gdrive/upload", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: file.path }),
-      });
-      const data = await res.json();
-      if (res.ok && data.link) {
-        btn.classList.remove("busy");
-        btn.classList.add("ok");
-        msgEl.innerHTML = `Saved — <a href="${esc(data.link)}" target="_blank" rel="noopener">open in Drive</a>`;
-      } else {
-        btn.classList.remove("busy");
-        btn.classList.add("err");
-        msgEl.textContent = (data.detail || "Upload failed").slice(0, 120);
-        setTimeout(() => { btn.classList.remove("err"); msgEl.textContent = ""; }, 6000);
-      }
-    } catch {
-      btn.classList.remove("busy");
-      btn.classList.add("err");
-      msgEl.textContent = "Upload failed (server unreachable)";
-    }
-  }
-
-  $("btnRefreshOutputs").onclick = loadOutputs;
-  $("gdriveHow").onclick = async () => {
-    const span = $("gdriveBanner").querySelector("span");
-    if (span.dataset.expanded) {
-      span.textContent = "Google Drive saving is not configured.";
-      delete span.dataset.expanded;
-      return;
-    }
-    try {
-      const res = await fetch("/api/gdrive/status");
-      const data = await res.json();
-      span.textContent = data.hint;
-      span.dataset.expanded = "1";
-    } catch { /* ignore */ }
-  };
 
   // -------------------------------------------------------- history drawer
   const historyDrawer = $("historyDrawer");
@@ -456,37 +744,69 @@
   };
 
   async function loadHistory() {
+    const list = $("historyList");
+    let data;
     try {
-      const res = await fetch("/api/sessions");
-      const data = await res.json();
-      const list = $("historyList");
-      if (!data.sessions.length) {
-        list.innerHTML = `<div class="pane-empty">No past tasks yet.</div>`;
-        return;
-      }
-      list.innerHTML = "";
-      for (const s of data.sessions) {
-        const item = document.createElement("div");
-        item.className = "history-item" + (s.id === state.sessionId ? " current" : "") + (s.running ? " running" : "");
-        item.innerHTML = `
-          <span class="h-dot"></span>
-          <div class="h-body">
-            <div class="h-title" title="${esc(s.title)}">${esc(s.title)}</div>
-            <div class="h-meta">${timeAgo(s.created_at)}${s.running ? " · running" : ""}</div>
-          </div>
-          <button class="h-del" title="Delete"><svg class="ic"><use href="#i-trash"/></svg></button>`;
-        item.onclick = () => switchSession(s.id);
-        item.querySelector(".h-del").onclick = async (e) => {
-          e.stopPropagation();
-          if (!confirm("Delete this task and its history?")) return;
-          await fetch(`/api/sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
-          if (s.id === state.sessionId) { resetToNewSession(); return; }
-          loadHistory();
-        };
-        list.appendChild(item);
-      }
-    } catch { /* server unreachable; keep old list */ }
+      data = await fetchJson("/api/sessions");
+    } catch {
+      list.innerHTML = errorRow("Could not load task history.", "history");
+      bindRetry(list, loadHistory);
+      return;
+    }
+    if (!data.sessions.length) {
+      list.innerHTML = `<div class="pane-empty">No past tasks yet. Send a message to start one.</div>`;
+      return;
+    }
+    list.innerHTML = "";
+    for (const s of data.sessions) {
+      const item = document.createElement("div");
+      item.className = "history-item" + (s.id === state.sessionId ? " current" : "") + (s.running ? " running" : "");
+      item.innerHTML = `
+        <span class="h-dot"></span>
+        <div class="h-body">
+          <div class="h-title" title="${esc(s.title)}">${esc(s.title)}</div>
+          <div class="h-meta">${timeAgo(s.created_at)}${s.running ? " · running" : ""}</div>
+        </div>
+        <button class="h-del" title="Delete" aria-label="Delete this task"><svg class="ic"><use href="#i-trash"/></svg></button>`;
+      item.onclick = () => switchSession(s.id);
+      item.querySelector(".h-del").onclick = async (e) => {
+        e.stopPropagation();
+        if (!confirm("Delete this task and its history? This cannot be undone.")) return;
+        try {
+          await fetchJson(`/api/sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
+        } catch {
+          showToast("Could not delete the task — check your connection and try again.", "error");
+          return;
+        }
+        if (s.id === state.sessionId) { resetToNewSession(); return; }
+        loadHistory();
+      };
+      list.appendChild(item);
+    }
+    applyHistoryFilter();
   }
+
+  // Client-side filter over what's already loaded (P2-4). This is NOT the
+  // mandated global search across runs/logs/outputs — that needs a
+  // server-side index this local, in-memory session store doesn't have.
+  // See UI_ENGAGEMENT.md §5 for the deferral reasoning.
+  function applyHistoryFilter() {
+    const q = $("historySearch").value.trim().toLowerCase();
+    $("historyList").querySelectorAll(".history-item").forEach((item) => {
+      const hay = item.querySelector(".h-title")?.textContent.toLowerCase() || "";
+      item.classList.toggle("hidden", q.length > 0 && !hay.includes(q));
+    });
+  }
+  $("historySearch").addEventListener("input", applyHistoryFilter);
+
+  // Live timeline filter (P2-5) — same client-side-only caveat as history
+  // search: filters what's already rendered, not a server-side log index.
+  $("timelineFilter").addEventListener("input", (e) => {
+    const q = e.target.value.trim().toLowerCase();
+    timeline.querySelectorAll(".tl-item").forEach((it) => {
+      it.classList.toggle("hidden", q.length > 0 && !it.textContent.toLowerCase().includes(q));
+    });
+  });
 
   function switchSession(sid) {
     if (sid === state.sessionId) { closeHistory(); return; }
@@ -495,6 +815,7 @@
     state.intentionalClose = false;
     state.sessionId = sid;
     sessionStorage.setItem("openmanus_sid", sid);
+    history.replaceState(null, "", `#s=${sid}`);
     setRunning(false);
     resetPanes();
     state.files.clear();
@@ -510,6 +831,7 @@
     state.intentionalClose = false;
     state.sessionId = crypto.randomUUID();
     sessionStorage.setItem("openmanus_sid", state.sessionId);
+    history.replaceState(null, "", `#s=${state.sessionId}`);
     setRunning(false);
     resetPanes();
     state.files.clear();
@@ -572,6 +894,12 @@
       setRunning(true);
       state.pinnedTab = false;
       state.toolCards.clear();
+      state.actionCount = 0;
+      state.submitPending = false; // echo received — composer unlocked
+      state.runTokens = { in: 0, out: 0 };
+      state.lastPrompt = ev.prompt; // for the Retry action on failure/stop
+      syncSend();
+      dropActivityPill();
       addUserMessage(ev.prompt);
       if (!historyDrawer.classList.contains("hidden")) loadHistory();
     },
@@ -593,18 +921,35 @@
       $("stepStat").textContent = `Step ${ev.current}/${ev.max}`;
     },
     tool_start(ev) {
-      const chatEl = addToolCard(ev);
+      state.actionCount += 1;
+      updateActivityPill(ev);
       const tlEl = timelineAdd(ev);
-      state.toolCards.set(ev.id, { chatEl, tlEl });
+      state.toolCards.set(ev.id, tlEl);
       autoSwitch(toolUI(ev.name, ev.category).cat);
     },
     tool_end(ev) {
-      const card = state.toolCards.get(ev.id);
-      if (!card) return;
-      const status = ev.ok ? `${fmtDur(ev.duration_ms)} ${icon("i-check")}` : `${icon("i-x")} failed`;
-      for (const el of [card.chatEl, card.tlEl]) {
-        el.classList.add(ev.ok ? "ok" : "err");
-        el.querySelector(".tool-status, .tl-status").innerHTML = status;
+      const tlEl = state.toolCards.get(ev.id);
+      if (tlEl) {
+        tlEl.classList.add(ev.ok ? "ok" : "err");
+        tlEl.querySelector(".tl-status").innerHTML = ev.ok
+          ? `${fmtDur(ev.duration_ms)} ${icon("i-check")}`
+          : `${icon("i-x")} failed`;
+      }
+      // Feed the tool-call inspector (P1-8): merge in what tool_start didn't
+      // have yet — status, duration, and the raw result/observation.
+      const data = toolCallData.get(ev.id) || {};
+      Object.assign(data, {
+        ok: ev.ok,
+        duration_ms: ev.duration_ms,
+        result: ev.result,
+        truncated: (ev.result || "").length >= 2000,
+      });
+      toolCallData.set(ev.id, data);
+      refreshToolInspector(ev.id);
+      const pill = state.activityPill;
+      if (pill && !ev.ok) {
+        pill.querySelector(".ap-label").textContent = "Last action failed";
+        pill.querySelector(".ap-status").innerHTML = icon("i-x");
       }
     },
     terminal(ev) { addTerminalBlock(ev.code, ev.output); },
@@ -636,16 +981,49 @@
       const pill = $("livePill");
       pill.classList.remove("running");
       $("liveLabel").textContent = "Done";
+      state.runOutcome = "completed";
     },
     status(ev) {
       if (ev.status === "stopped") {
         const pill = $("livePill");
         pill.classList.add("stopped");
         $("liveLabel").textContent = "Stopped";
+        finalizeActivityPill(false);
+        state.runOutcome = "stopped";
       }
     },
-    error(ev) { addError(ev.message); },
-    run_end() { setRunning(false); },
+    error(ev) { addError(ev.message); state.runOutcome = "failed"; },
+    run_end() {
+      setRunning(false);
+      state.submitPending = false;
+      syncSend();
+      finalizeActivityPill(state.runOutcome !== "stopped");
+      addRunReport();
+      state.runOutcome = "";
+    },
+    usage(ev) {
+      state.tokens.in = ev.total_in;
+      state.tokens.out = ev.total_out;
+      state.runTokens.in += ev.delta_in || 0;
+      state.runTokens.out += ev.delta_out || 0;
+      $("tokenStat").textContent =
+        `${state.tokens.in.toLocaleString()} in / ${state.tokens.out.toLocaleString()} out`;
+    },
+    control(ev) {
+      // Audit trail: operator actions land in the timeline (and replay log).
+      if (timeline.querySelector(".pane-empty")) timeline.innerHTML = "";
+      const el = document.createElement("div");
+      el.className = "tl-item tl-control";
+      const label = ev.action === "stop" ? "Stop requested by operator"
+        : ev.action === "model_switch" ? `Model switched to ${ev.model}`
+        : `${ev.action} by ${ev.actor || "operator"}`;
+      el.innerHTML = `
+        <div class="tl-icon chat">${icon("i-chat")}</div>
+        <div class="tl-body"><div class="tl-title">${esc(label)}</div></div>
+        <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>`;
+      timeline.appendChild(el);
+      scrollDown($("pane-live"));
+    },
     pong() {},
   };
 
@@ -660,13 +1038,42 @@
     $("stepStat").textContent = "Step 0/0";
     $("elapsedStat").textContent = "0:00";
     state.toolCards.clear();
+    state.activityPill = null;
+    state.actionCount = 0;
     state.activeFile = null;
     state.zoom = 1;
+    toolCallData.clear();
+    prunedCounts.clear();
+    const timelineFilter = $("timelineFilter");
+    if (timelineFilter) timelineFilter.value = "";
   }
 
   // -------------------------------------------------------- websocket
+  const { composerDecision, backoffDelay, pruneCount, absoluteTime } = window.UIUtils;
+
+  // Returns true only when the frame actually went out on an OPEN socket.
   function send(obj) {
-    if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(obj));
+    if (state.ws?.readyState === WebSocket.OPEN) {
+      state.ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }
+
+  const reconnectBanner = $("reconnectBanner");
+  let reconnectAttempt = 0;
+  let reconnectTimer = null;
+
+  function setReconnecting(on) {
+    reconnectBanner.classList.toggle("hidden", !on);
+    if (on) {
+      $("reconnectLabel").textContent =
+        `Connection lost — reconnecting${reconnectAttempt > 1 ? ` (attempt ${reconnectAttempt})` : ""}...`;
+      $("liveLabel").textContent = "Reconnecting";
+      if (state.running) clearInterval(state.timer); // elapsed pauses at last known truth
+    } else if (!state.running) {
+      $("liveLabel").textContent = "Idle";
+    }
   }
 
   function connect() {
@@ -674,6 +1081,14 @@
     const ws = new WebSocket(`${proto}://${location.host}/ws/${state.sessionId}`);
     state.ws = ws;
 
+    ws.onopen = () => {
+      reconnectAttempt = 0;
+      setReconnecting(false);
+      if (state.running) { // resume elapsed ticking from server-truth events
+        $("liveLabel").textContent = "Working";
+        state.timer = setInterval(() => ($("elapsedStat").textContent = fmtTime()), 1000);
+      }
+    };
     ws.onmessage = (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
@@ -682,7 +1097,11 @@
     };
     ws.onclose = () => {
       state.ws = null;
-      if (!state.intentionalClose) setTimeout(connect, 2000);
+      if (state.intentionalClose) return;
+      reconnectAttempt += 1;
+      setReconnecting(true);
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connect, backoffDelay(reconnectAttempt)); // 1s→15s cap
     };
     ws.onerror = () => ws.close();
   }
@@ -691,11 +1110,25 @@
   const input = $("promptInput");
 
   function submitPrompt() {
-    const text = input.value.trim();
-    if (!text || state.running) return;
-    send({ type: "run", prompt: text });
-    input.value = "";
-    autosize();
+    const decision = composerDecision(
+      input.value,
+      state.ws?.readyState === WebSocket.OPEN,
+      state.running,
+      state.submitPending
+    );
+    if (decision.action === "block-empty") return;
+    if (decision.action === "block-offline") {
+      addError("Not connected — prompt kept. Reconnecting; try again in a moment.");
+      return;
+    }
+    if (decision.action === "block-running" || decision.action === "block-pending") return;
+    if (!send({ type: "run", prompt: input.value.trim() })) {
+      addError("Send failed — prompt kept. Check the connection banner.");
+      return;
+    }
+    state.submitPending = true;
+    syncSend();
+    if (decision.clearInput) { input.value = ""; autosize(); }
   }
 
   function autosize() {
@@ -782,24 +1215,29 @@
       card.onclick = async (e) => {
         const act = e.target.closest("[data-act]")?.dataset.act;
         if (act === "edit") { startEdit(m); return; }
-        if (act === "del") {
-          e.stopPropagation();
-          if (!confirm(`Delete model "${m.label}"?`)) return;
-          const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
-          if (res.ok) { await reloadModels(); formMsg("Model deleted"); }
-          else formMsg((await res.json()).detail || "Delete failed", true);
-          return;
+        try {
+          if (act === "del") {
+            e.stopPropagation();
+            if (!confirm(`Delete model "${m.label}"? This cannot be undone.`)) return;
+            const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
+            if (res.ok) { await reloadModels(); formMsg("Model deleted"); }
+            else formMsg((await res.json()).detail || "Delete failed", true);
+            return;
+          }
+          if (isActive) return;
+          const res = await fetch("/api/models/active", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ id: m.id }),
+          });
+          if (res.ok) {
+            await reloadModels();
+            formMsg(`Switched to ${m.model}`);
+          } else formMsg("Switch failed", true);
+        } catch {
+          // Network error: don't let this become an unhandled rejection (P0-3/P1-7).
+          formMsg("Request failed — check your connection and try again.", true);
         }
-        if (isActive) return;
-        const res = await fetch("/api/models/active", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ id: m.id }),
-        });
-        if (res.ok) {
-          await reloadModels();
-          formMsg(`Switched to ${m.model}`);
-        } else formMsg("Switch failed", true);
       };
       list.appendChild(card);
     }
@@ -896,9 +1334,46 @@
   updateModelChip();
 
   // Keep the send button enabled only when there is text and agent is idle.
-  const syncSend = () => { $("btnSend").disabled = !input.value.trim() || state.running; };
+  const syncSend = () => { $("btnSend").disabled = !input.value.trim() || state.running || state.submitPending; };
   input.addEventListener("input", syncSend);
   new MutationObserver(syncSend).observe($("btnStop"), { attributes: true, attributeFilter: ["class"] });
+
+  // Theme: dark is the ops-console default; the operator's explicit choice
+  // persists. No prefers-color-scheme override — the spec mandates dark default.
+  const applyTheme = (theme) => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("om_theme", theme);
+    $("btnTheme").textContent = theme === "dark" ? "Light" : "Dark";
+    $("btnTheme").setAttribute("aria-label", `Switch to ${theme === "dark" ? "light" : "dark"} theme`);
+  };
+  applyTheme(localStorage.getItem("om_theme") || "dark");
+  $("btnTheme").onclick = () =>
+    applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
+
+  // Keyboard support for the tab list (P1-6).
+  $("tabs").addEventListener("keydown", (e) => {
+    const tabsEl = [...document.querySelectorAll(".tab")];
+    const idx = tabsEl.indexOf(document.activeElement);
+    if (idx === -1) return;
+    const next = e.key === "ArrowRight" ? idx + 1 : e.key === "ArrowLeft" ? idx - 1 : -1;
+    if (next >= 0 && next < tabsEl.length) {
+      e.preventDefault();
+      tabsEl[next].focus();
+      tabsEl[next].click();
+    } else if (e.key === "Home" && tabsEl[0]) {
+      e.preventDefault(); tabsEl[0].focus(); tabsEl[0].click();
+    } else if (e.key === "End" && tabsEl.length) {
+      e.preventDefault(); tabsEl.at(-1).focus(); tabsEl.at(-1).click();
+    }
+  });
+
+  // Regression-test hooks (Playwright); inert in normal use.
+  window.__om = {
+    state, send, submitPrompt, switchTab, setReconnecting,
+    // Test-only event dispatcher: drives the same HANDLERS a real WS message
+    // would, without needing a live agent run. Inert in normal use.
+    dispatch: (type, data) => HANDLERS[type]?.(data || {}),
+  };
 
   connect();
 })();
