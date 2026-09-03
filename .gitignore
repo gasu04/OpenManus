@@ -9,8 +9,7 @@ data/
 workspace/*
 !workspace/webapp.py
 !workspace/run_webapp.sh
-!workspace/README_webapp.md
-!workspace/UI_ENGAGEMENT.md
+!workspace/*.md
 !workspace/static/
 !workspace/static/**
 !workspace/tests/

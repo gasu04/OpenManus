@@ -592,6 +592,12 @@
       throw err;
     }
     clearTimeout(t);
+    if (res.status === 401) {
+      // Session expired/invalidated server-side — reload so "/" renders the
+      // sign-in page instead of leaving the UI stuck retrying forever.
+      location.reload();
+      return new Promise(() => {}); // navigation is imminent; never resolve
+    }
     if (res.status >= 500 && attempt <= MAX_FETCH_RETRIES) {
       await sleep(backoffDelay(attempt));
       return fetchJson(url, opts, attempt + 1);
@@ -858,6 +864,17 @@
     historyDrawer.classList.contains("hidden") ? openHistory() : closeHistory();
   $("historyClose").onclick = closeHistory;
 
+  $("btnLogout").onclick = async () => {
+    if (!confirm("Sign out? You'll need your password again to get back in.")) return;
+    try {
+      await fetch("/api/logout", { method: "POST" });
+    } catch {
+      // fall through to reload regardless — worst case the cookie is still
+      // valid and "/" simply shows the app again, which is safe either way
+    }
+    location.reload();
+  };
+
   // -------------------------------------------------------- run state UI
   function setRunning(on) {
     state.running = on;
@@ -1095,9 +1112,19 @@
       const h = HANDLERS[msg.type];
       if (h) { try { h(msg.data || {}); } catch (err) { console.error("event handler failed", err); } }
     };
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       state.ws = null;
       if (state.intentionalClose) return;
+      // Code 1008 = policy violation (auth/session/origin rejected server-side).
+      // Retrying with the same dead credential forever just spams the
+      // server; a full reload re-runs the "/" auth check and shows the
+      // sign-in page if the session is genuinely gone (idle/absolute
+      // timeout, logout, or lockout).
+      if (ev.code === 1008) {
+        showToast("Session ended — reloading to sign in again.", "error", 3000);
+        setTimeout(() => location.reload(), 1200);
+        return;
+      }
       reconnectAttempt += 1;
       setReconnecting(true);
       clearTimeout(reconnectTimer);

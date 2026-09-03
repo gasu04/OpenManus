@@ -73,20 +73,55 @@ def server():
 
 @pytest.fixture(scope="module")
 def page(server):
+    # Auth is now session-cookie based (Remote Access engagement, Phase 1):
+    # "/" no longer sends a WWW-Authenticate challenge (by design - real
+    # users get a proper login page, not a native browser popup), so
+    # Playwright's http_credentials (which waits for that challenge) no
+    # longer applies here. Log in through the real form instead, exactly as
+    # an operator would - this also exercises the login page itself.
     with sync_playwright() as p:
         browser = p.chromium.launch()
-        context = browser.new_context(
-            http_credentials={"username": AUTH[0], "password": AUTH[1]},
-        )
+        context = browser.new_context()
         context.grant_permissions(["clipboard-read", "clipboard-write"])
         page = context.new_page()
         errors = []
         page.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
         page.goto(f"http://127.0.0.1:{server}/", wait_until="networkidle")
+        page.fill("#u", AUTH[0])
+        page.fill("#p", AUTH[1])
+        page.click("button[type=submit]")
+        page.wait_for_load_state("networkidle")
         page.wait_for_function("() => window.__om && window.__om.state.ws?.readyState === 1")
         yield page, errors
         print("console errors:", errors)
         browser.close()
+
+
+def test_login_wrong_credentials_shows_error_and_keeps_login_page(page):
+    page, _ = page
+    # Fresh, unauthenticated context off the same browser instance (a nested
+    # sync_playwright() call here would conflict with the module fixture's).
+    ctx = page.context.browser.new_context()
+    pg = ctx.new_page()
+    pg.goto(f"http://{page.url.split('/')[2]}/", wait_until="networkidle")
+    pg.fill("#u", AUTH[0])
+    pg.fill("#p", "definitely-wrong-password")
+    pg.click("button[type=submit]")
+    expect(pg.locator("#e")).to_have_text("Invalid credentials", timeout=5000)
+    # Must still be the login form, not the app shell (acceptance test #1).
+    assert pg.locator("#promptInput").count() == 0
+    ctx.close()
+
+
+def test_unauthenticated_root_serves_login_not_app_shell(page):
+    page, _ = page
+    ctx = page.context.browser.new_context()
+    pg = ctx.new_page()
+    resp = pg.goto(f"http://{page.url.split('/')[2]}/", wait_until="networkidle")
+    assert resp.status == 401
+    assert pg.locator("#promptInput").count() == 0
+    assert pg.locator("#f input#u").count() == 1  # the login form, and nothing else
+    ctx.close()
 
 
 def test_p0_prompt_survives_disconnected_send(page):
@@ -256,13 +291,33 @@ def test_p2_history_filter_hides_non_matching_rows(page):
     page.click("#historyClose")
 
 
+def test_logout_invalidates_the_session_server_side(page):
+    page, _ = page
+    old_cookie = next(c for c in page.context.cookies() if c["name"] == "om_session")
+    page.on("dialog", lambda d: d.accept())  # confirm() on the logout button
+    page.click("#btnLogout")
+    page.wait_for_load_state("networkidle")
+    expect(page.locator("#f input#u")).to_be_visible(timeout=5000)  # back at the login form
+    # Prove *server-side* invalidation, not just the client forgetting the
+    # cookie: replay the exact old token and confirm the server itself
+    # rejects it.
+    page.context.add_cookies([old_cookie])
+    resp = page.request.get(page.url)
+    assert resp.status == 401
+
+
 def test_no_console_errors_after_suite(page):
     _, errors = page
-    # The two synthetic global-error tests above are expected to log to
-    # console.error by design (that's the point of the safety net) — ignore
-    # only those two tagged, deliberate entries.
+    # The two synthetic global-error tests are expected to log to
+    # console.error by design (that's the point of the safety net); the
+    # logout test's final reload deliberately hits "/" post-logout and gets
+    # a real 401 (login page), which Chromium logs for the top-level
+    # navigation itself — also expected, not a defect.
     unexpected = [
         e for e in errors
-        if "favicon" not in e and "round2-boom" not in e and "round2-rejection" not in e
+        if "favicon" not in e
+        and "round2-boom" not in e
+        and "round2-rejection" not in e
+        and "401 (Unauthorized)" not in e
     ]
     assert not unexpected, f"console errors: {unexpected}"

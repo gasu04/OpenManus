@@ -16,11 +16,26 @@ Architecture:
       a page refresh mid-run loses nothing.
 
 Configuration (environment variables):
-    WEBAPP_AUTH_USER / WEBAPP_AUTH_PASS   Basic-auth credentials. If the
-                                          password is unset a random one is
-                                          generated and printed to console.
+    WEBAPP_AUTH_USER / WEBAPP_AUTH_PASS   Login credentials. If the password
+                                          is unset a random one is generated
+                                          and printed to console. Also
+                                          accepted as HTTP Basic auth for
+                                          scripts/tests (no session/timeout
+                                          semantics on that path - see
+                                          workspace/REMOTE_ACCESS_ENGAGEMENT.md).
     WEBAPP_HOST / WEBAPP_PORT             Bind address (default 127.0.0.1:8000).
     WEBAPP_MAX_STEPS                      Agent step limit (default 30).
+    WEBAPP_ALLOWED_ORIGINS                Comma-separated Origin allowlist for
+                                          CSRF/WS-Origin checks (default:
+                                          http(s)://127.0.0.1 and localhost at
+                                          WEBAPP_PORT). Add the public hostname
+                                          here once a tunnel is in front.
+    WEBAPP_SESSION_IDLE_MINUTES           Idle session timeout (default 30).
+    WEBAPP_SESSION_ABSOLUTE_HOURS         Absolute session lifetime (default 12).
+    WEBAPP_COOKIE_SECURE                  "1" to mark the session cookie
+                                          Secure (requires HTTPS in front -
+                                          set this once a tunnel terminates
+                                          TLS). Default "0" for local HTTP.
 
 Usage:
     .venv/bin/python workspace/webapp.py
@@ -32,22 +47,22 @@ Tier 2 (failure is loud: HTTP/WS errors surface in the browser and logs).
 import asyncio
 import base64
 import json
+import logging
 import mimetypes
 import os
 import secrets
 import sys
 import time
 import traceback
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -70,6 +85,61 @@ MAX_EVENT_LOG = 2000             # per-session replay buffer
 HUMAN_REPLY_TIMEOUT = 600        # seconds to wait for ask_human answer
 SNAPSHOT_BYTES = 200_000         # max file content pushed in file_update events
 
+# Origin allowlist: used for CSRF defense on state-changing HTTP routes and
+# for the WebSocket handshake. This app is same-origin only (frontend and
+# API share one FastAPI process) so there is no legitimate cross-origin use
+# case - CORSMiddleware was previously configured as allow_origins=["*"] +
+# allow_credentials=True, which is a real vulnerability (a browser
+# auto-reattaches cached Basic-auth/session cookies on same-origin requests,
+# and Starlette reflects the caller's Origin back when credentials are
+# allowed, so *any* page could read/mutate this API - see
+# workspace/REMOTE_ACCESS_ENGAGEMENT.md finding T-1/T-2). Fixed by removing
+# CORS entirely and validating Origin explicitly instead.
+#
+# WEBAPP_ALLOWED_ORIGINS unset (local/dev default): any port on
+# 127.0.0.1/localhost/::1 is accepted, regardless of which port this process
+# actually bound to. This does not weaken the threat model the check exists
+# for: a *remote* attacker's page can never make a browser send an Origin of
+# 127.0.0.1/localhost, no matter what it does - only a page actually served
+# from this machine can, whatever port it happens to be bound to. Once a
+# tunnel is in front (Phase 2), set WEBAPP_ALLOWED_ORIGINS explicitly to the
+# public hostname(s) and this leniency no longer applies - matching becomes
+# an exact allowlist with no fallback.
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("WEBAPP_ALLOWED_ORIGINS", "").split(",")
+    if o.strip()
+]
+_LOCAL_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+
+
+def _origin_allowed(origin: Optional[str]) -> bool:
+    """True when `origin` may talk to this app (see ALLOWED_ORIGINS comment).
+
+    A missing Origin header (non-browser clients: curl, scripts, tests) is
+    always allowed - it's not a vector for browser-mediated CSRF.
+    """
+    if origin is None:
+        return True
+    if ALLOWED_ORIGINS:
+        return origin in ALLOWED_ORIGINS
+    try:
+        from urllib.parse import urlparse
+
+        host = urlparse(origin).hostname
+    except ValueError:
+        return False
+    return host in _LOCAL_ORIGIN_HOSTS
+
+SESSION_COOKIE_NAME = "om_session"
+SESSION_IDLE_SECONDS = int(os.environ.get("WEBAPP_SESSION_IDLE_MINUTES", "30")) * 60
+SESSION_ABSOLUTE_SECONDS = int(os.environ.get("WEBAPP_SESSION_ABSOLUTE_HOURS", "12")) * 3600
+COOKIE_SECURE = os.environ.get("WEBAPP_COOKIE_SECURE", "0") == "1"
+
+RATE_LIMIT_MAX_ATTEMPTS = 5      # failures before lockout kicks in
+RATE_LIMIT_BASE_LOCKOUT = 2.0    # seconds; doubles per additional failure
+RATE_LIMIT_MAX_LOCKOUT = 900.0   # 15 minutes, hard cap
+
 if "WEBAPP_AUTH_PASS" not in os.environ:
     print(
         f"\n{'=' * 60}\n"
@@ -83,65 +153,349 @@ if "WEBAPP_AUTH_PASS" not in os.environ:
 
 WORKSPACE_ROOT = config.workspace_root.resolve()
 
+# Secrets at rest should not be world/group-readable. Best-effort: a
+# read-only filesystem or a file that doesn't exist yet must not crash boot.
+for _secret_path in (PROJECT_ROOT / "config" / "config.toml", Path(__file__).parent / "webapp_models.json"):
+    try:
+        if _secret_path.exists():
+            os.chmod(_secret_path, 0o600)
+    except OSError:
+        pass
+
+# ---------------------------------------------------------------------------
+# Structured access log (timestamp, source IP, identity, route, status) -
+# bounded via rotation so it can never grow unbounded (Tier 2: loud on read,
+# but the file itself must not be able to fill the disk).
+# ---------------------------------------------------------------------------
+_LOG_DIR = PROJECT_ROOT / "logs"
+_LOG_DIR.mkdir(parents=True, exist_ok=True)
+access_logger = logging.getLogger("openmanus.webapp.access")
+access_logger.setLevel(logging.INFO)
+access_logger.propagate = False
+if not access_logger.handlers:  # avoid duplicate handlers on module reload (tests import this module directly)
+    _access_handler = RotatingFileHandler(_LOG_DIR / "webapp_access.log", maxBytes=5_000_000, backupCount=3)
+    _access_handler.setFormatter(logging.Formatter("%(message)s"))
+    access_logger.addHandler(_access_handler)
+
+
+def _client_ip(conn: Any) -> str:
+    """Best-effort source IP for a Request or WebSocket (never raises)."""
+    client = getattr(conn, "client", None)
+    return client.host if client else "unknown"
+
+
+def _log_access(conn: Any, identity: str, status: int) -> None:
+    """One structured line per request: never logs credentials or payloads."""
+    path = conn.url.path if hasattr(conn, "url") else "-"
+    method = getattr(conn, "method", "-")
+    access_logger.info(
+        f"ts={time.time():.0f} ip={_client_ip(conn)} identity={identity} "
+        f"method={method} path={path} status={status}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting: brute-force protection on the login path (§4 Phase 1).
+# Capped exponential backoff per source IP, bounded table size.
+# ---------------------------------------------------------------------------
+_failed_attempts: Dict[str, Dict[str, float]] = {}
+
+
+def _is_locked_out(ip: str) -> float:
+    """Seconds remaining in lockout for this IP, or 0.0 if not locked out."""
+    entry = _failed_attempts.get(ip)
+    if not entry:
+        return 0.0
+    return max(0.0, entry["locked_until"] - time.monotonic())
+
+
+def _record_auth_failure(ip: str) -> None:
+    entry = _failed_attempts.setdefault(ip, {"count": 0, "locked_until": 0.0})
+    entry["count"] += 1
+    if entry["count"] >= RATE_LIMIT_MAX_ATTEMPTS:
+        step = entry["count"] - RATE_LIMIT_MAX_ATTEMPTS
+        delay = min(RATE_LIMIT_MAX_LOCKOUT, RATE_LIMIT_BASE_LOCKOUT * (2**step))
+        entry["locked_until"] = time.monotonic() + delay
+    if len(_failed_attempts) > 1000:  # bounded table: prune stale, non-locked entries
+        now = time.monotonic()
+        for stale_ip in [
+            k for k, v in _failed_attempts.items()
+            if v["locked_until"] < now and v["count"] < RATE_LIMIT_MAX_ATTEMPTS
+        ]:
+            _failed_attempts.pop(stale_ip, None)
+
+
+def _record_auth_success(ip: str) -> None:
+    _failed_attempts.pop(ip, None)
+
+
+# ---------------------------------------------------------------------------
+# Session store: opaque server-side tokens (not JWTs - nothing client-side
+# needs to verify, and there's no signing-key rotation complexity this way).
+# In-memory by design: sessions do not need to survive a server restart for
+# a single-operator local tool, and this keeps the whole auth layer
+# dependency-free.
+# ---------------------------------------------------------------------------
+_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+def _prune_expired_sessions() -> None:
+    now = time.monotonic()
+    expired = [
+        t for t, e in _sessions.items()
+        if now - e["created"] > SESSION_ABSOLUTE_SECONDS or now - e["last_seen"] > SESSION_IDLE_SECONDS
+    ]
+    for t in expired:
+        _sessions.pop(t, None)
+
+
+def _create_session(username: str) -> str:
+    _prune_expired_sessions()  # opportunistic: catches sessions nobody ever revisits
+    token = secrets.token_urlsafe(32)
+    now = time.monotonic()
+    _sessions[token] = {"username": username, "created": now, "last_seen": now}
+    return token
+
+
+def _validate_session(token: Optional[str]) -> Optional[str]:
+    """Returns the username for a live session token, else None.
+
+    Enforces both idle and absolute timeouts; touches last_seen (sliding
+    idle window) on success. Expired/unknown tokens are dropped from the
+    store so they can't be reused.
+    """
+    if not token:
+        return None
+    entry = _sessions.get(token)
+    if not entry:
+        return None
+    now = time.monotonic()
+    if now - entry["created"] > SESSION_ABSOLUTE_SECONDS or now - entry["last_seen"] > SESSION_IDLE_SECONDS:
+        _sessions.pop(token, None)
+        return None
+    entry["last_seen"] = now
+    return entry["username"]
+
+
+def _destroy_session(token: Optional[str]) -> None:
+    if token:
+        _sessions.pop(token, None)
+
+
 app = FastAPI(title="OpenManus Web")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-security = HTTPBasic()
 
 
 # ---------------------------------------------------------------------------
-# Auth
+# Auth: session cookie (primary, has idle/absolute timeouts + logout) with
+# HTTP Basic accepted as a back-compat fallback for scripts/curl/tests (that
+# path has no timeout semantics - it's the same shared credential, just
+# without a revocable session; see workspace/REMOTE_ACCESS_ENGAGEMENT.md).
 # ---------------------------------------------------------------------------
-def verify_credentials(credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    """Basic-auth dependency protecting every HTTP route.
-
-    Args:
-        credentials: Parsed Authorization header.
+def _check_basic_header(auth_header: str) -> Optional[str]:
+    """Parse and verify a `Basic ...` Authorization header value.
 
     Returns:
-        Authenticated username.
-
-    Raises:
-        HTTPException: 401 when username or password mismatches.
+        The username on success, else None. Never raises.
     """
-    ok_user = secrets.compare_digest(credentials.username, AUTH_USERNAME)
-    ok_pass = secrets.compare_digest(credentials.password, AUTH_PASSWORD)
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=401, detail="Invalid credentials", headers={"WWW-Authenticate": "Basic"}
-        )
-    return credentials.username
-
-
-def verify_ws_credentials(websocket: WebSocket) -> bool:
-    """Apply the same basic-auth check to the WebSocket handshake.
-
-    Browsers resend cached Basic-auth headers on same-origin upgrades, but a
-    client connecting directly must be checked here too.
-
-    Args:
-        websocket: Incoming WebSocket connection.
-
-    Returns:
-        True when the Authorization header carries valid credentials.
-    """
-    auth_header = websocket.headers.get("authorization", "")
     if not auth_header.startswith("Basic "):
-        return False
+        return None
     try:
         decoded = base64.b64decode(auth_header[len("Basic "):]).decode("utf-8")
         username, _, password = decoded.partition(":")
     except Exception:
-        return False
-    return secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(
-        password, AUTH_PASSWORD
+        return None
+    if secrets.compare_digest(username, AUTH_USERNAME) and secrets.compare_digest(password, AUTH_PASSWORD):
+        return username
+    return None
+
+
+def _resolve_auth(request: Request) -> Optional[str]:
+    """Resolve the caller's identity without raising (session cookie, then Basic).
+
+    Rate-limited: returns None immediately while the source IP is locked out,
+    without re-checking credentials (prevents a lockout from being a free
+    oracle for guessing).
+    """
+    if _is_locked_out(_client_ip(request)) > 0:
+        return None
+    username = _validate_session(request.cookies.get(SESSION_COOKIE_NAME))
+    if username:
+        return username
+    username = _check_basic_header(request.headers.get("authorization", ""))
+    if username:
+        _record_auth_success(_client_ip(request))
+        return username
+    return None
+
+
+def require_auth(request: Request) -> str:
+    """FastAPI dependency: 401s (and rate-limits failures) instead of returning None.
+
+    Raises:
+        HTTPException: 429 while locked out; 401 on any other auth failure.
+    """
+    ip = _client_ip(request)
+    remaining = _is_locked_out(ip)
+    if remaining > 0:
+        raise HTTPException(status_code=429, detail=f"Too many failed attempts; retry in {int(remaining)}s")
+    username = _resolve_auth(request)
+    if username:
+        request.state.identity = username
+        return username
+    _record_auth_failure(ip)
+    raise HTTPException(status_code=401, detail="Authentication required")
+
+
+def _resolve_ws_auth(websocket: WebSocket) -> Optional[str]:
+    """Same resolution as `_resolve_auth`, adapted for the WebSocket handshake.
+
+    Re-run on every inbound client message (not just at connect) so idle and
+    absolute session timeouts actually take effect on long-lived connections.
+    """
+    cookie_header = websocket.headers.get("cookie", "")
+    token = None
+    for part in cookie_header.split(";"):
+        name, _, value = part.strip().partition("=")
+        if name == SESSION_COOKIE_NAME:
+            token = value
+            break
+    username = _validate_session(token)
+    if username:
+        return username
+    return _check_basic_header(websocket.headers.get("authorization", ""))
+
+
+def verify_ws_origin(websocket: WebSocket) -> bool:
+    """Reject cross-origin WebSocket handshakes (the CSRF vector in T-2).
+
+    Non-browser clients (scripts) send no Origin header at all and are not
+    subject to browser-mediated CSRF, so a missing Origin is allowed; a
+    *present but disallowed* Origin is always rejected.
+    """
+    return _origin_allowed(websocket.headers.get("origin"))
+
+
+LOGIN_PAGE_HTML = """<!doctype html>
+<html data-theme="dark"><head><meta charset="utf-8"/><title>OpenManus — Sign in</title>
+<style>
+  :root{--bg:#161619;--panel:#1e1e22;--text:#e9e9e4;--text-dim:#a8a69f;--accent:#8b8bf7;--border:#2c2c31;--err:#f26d6d;}
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg);color:var(--text);font:14px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;}
+  form{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:32px 28px;width:280px;}
+  h1{font-size:15px;margin:0 0 18px;font-weight:650;}
+  label{display:block;font-size:12px;color:var(--text-dim);margin:12px 0 4px;}
+  input{width:100%;box-sizing:border-box;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:8px 10px;color:var(--text);font-size:13px;}
+  input:focus{outline:2px solid var(--accent);outline-offset:1px;}
+  button{width:100%;margin-top:18px;padding:9px;border:none;border-radius:8px;background:var(--accent);color:#fff;font-weight:600;cursor:pointer;font-size:13px;}
+  .err{color:var(--err);font-size:12px;margin-top:10px;min-height:14px;}
+</style></head>
+<body>
+  <form id="f">
+    <h1>OpenManus</h1>
+    <label for="u">Username</label><input id="u" name="username" autocomplete="username" autofocus/>
+    <label for="p">Password</label><input id="p" name="password" type="password" autocomplete="current-password"/>
+    <button type="submit">Sign in</button>
+    <div class="err" id="e" role="alert"></div>
+  </form>
+  <script>
+    document.getElementById("f").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const errEl = document.getElementById("e");
+      errEl.textContent = "";
+      try {
+        const res = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            username: document.getElementById("u").value,
+            password: document.getElementById("p").value,
+          }),
+        });
+        if (res.ok) { location.href = "/"; return; }
+        const data = await res.json().catch(() => ({}));
+        errEl.textContent = data.detail || "Sign in failed";
+      } catch {
+        errEl.textContent = "Sign in failed — server unreachable";
+      }
+    });
+  </script>
+</body></html>"""
+
+
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+async def login(payload: LoginPayload, request: Request) -> JSONResponse:
+    """Verify credentials and issue a session cookie.
+
+    Args:
+        payload: username/password from the login form.
+        request: used for source-IP rate limiting and access logging.
+
+    Returns:
+        200 with a Set-Cookie session token on success; 401 on bad
+        credentials; 429 while the source IP is locked out from repeated
+        failures.
+    """
+    ip = _client_ip(request)
+    remaining = _is_locked_out(ip)
+    if remaining > 0:
+        return JSONResponse({"detail": f"Too many attempts; retry in {int(remaining)}s"}, status_code=429)
+    ok = secrets.compare_digest(payload.username, AUTH_USERNAME) and secrets.compare_digest(
+        payload.password, AUTH_PASSWORD
     )
+    if not ok:
+        _record_auth_failure(ip)
+        # No explicit _log_access here: the security_middleware logs every
+        # request generically (identity defaults to "-" since nothing below
+        # sets request.state.identity on this failing path) - one line, not two.
+        return JSONResponse({"detail": "Invalid credentials"}, status_code=401)
+    _record_auth_success(ip)
+    token = _create_session(payload.username)
+    request.state.identity = payload.username  # so the generic access-log line is accurate
+    response = JSONResponse({"status": "ok"})
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=SESSION_ABSOLUTE_SECONDS,
+        httponly=True,
+        samesite="strict",
+        secure=COOKIE_SECURE,
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/logout")
+async def logout(request: Request) -> JSONResponse:
+    """Invalidate the current session (server-side) and clear its cookie."""
+    _destroy_session(request.cookies.get(SESSION_COOKIE_NAME))
+    response = JSONResponse({"status": "ok"})
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+    return response
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Origin/CSRF check on mutating routes, static-asset auth gate, and
+    the structured access-log line for every request (§4 Phase 1)."""
+    if request.method in ("POST", "PUT", "DELETE", "PATCH"):
+        if not _origin_allowed(request.headers.get("origin")):
+            _log_access(request, "-", 403)
+            return JSONResponse({"detail": "Origin not allowed"}, status_code=403)
+    if request.url.path.startswith("/static/") and not _resolve_auth(request):
+        # StaticFiles is a raw ASGI sub-app with no FastAPI Depends() support,
+        # so the mount itself can't require auth - gate it here instead.
+        # Otherwise /static/index.html would serve the full app shell to an
+        # unauthenticated caller, bypassing "/"'s login gate entirely.
+        _log_access(request, "-", 401)
+        return JSONResponse({"detail": "Authentication required"}, status_code=401)
+    response = await call_next(request)
+    identity = getattr(request.state, "identity", None) or "-"
+    _log_access(request, identity, response.status_code)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -152,9 +506,21 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
 @app.get("/")
-async def root(username: str = Depends(verify_credentials)) -> FileResponse:
-    """Serve the main HTML page."""
-    return FileResponse(str(STATIC_DIR / "index.html"))
+async def root(request: Request) -> Response:
+    """Serve the app shell when authenticated, the login page otherwise.
+
+    Deliberately does not raise via `Depends(require_auth)`: an anonymous
+    visitor should see a real sign-in form, not a bare 401. No
+    `WWW-Authenticate` header is sent anywhere in this app (root or API) so
+    browsers never summon their native Basic-auth popup - `curl -u`/scripts
+    can still authenticate proactively without waiting for a challenge, and
+    the frontend redirects to this page itself on a 401 from any fetch.
+    """
+    username = _resolve_auth(request)
+    if username:
+        request.state.identity = username
+        return FileResponse(str(STATIC_DIR / "index.html"))
+    return HTMLResponse(LOGIN_PAGE_HTML, status_code=401)
 
 
 @app.get("/api/health")
@@ -187,7 +553,7 @@ def _safe_workspace_path(raw: str) -> Optional[Path]:
 
 
 @app.get("/api/files")
-async def list_files(username: str = Depends(verify_credentials)) -> JSONResponse:
+async def list_files(username: str = Depends(require_auth)) -> JSONResponse:
     """Return a shallow tree of files the agent has produced in the workspace.
 
     Returns:
@@ -222,7 +588,7 @@ async def list_files(username: str = Depends(verify_credentials)) -> JSONRespons
 
 @app.get("/api/file")
 async def read_file(
-    path: str = Query(...), username: str = Depends(verify_credentials)
+    path: str = Query(...), username: str = Depends(require_auth)
 ) -> JSONResponse:
     """Serve one workspace file's text content for the editor pane.
 
@@ -354,7 +720,7 @@ def _output_files(touched: set) -> List[Dict[str, Any]]:
 
 @app.get("/api/outputs")
 async def list_outputs(
-    session: str = Query(""), username: str = Depends(verify_credentials)
+    session: str = Query(""), username: str = Depends(require_auth)
 ) -> JSONResponse:
     """List downloadable output files for the Files tab.
 
@@ -370,7 +736,7 @@ async def list_outputs(
 
 @app.get("/api/download")
 async def download_file(
-    path: str = Query(...), username: str = Depends(verify_credentials)
+    path: str = Query(...), username: str = Depends(require_auth)
 ) -> FileResponse:
     """Stream one workspace file as an attachment (browser download)."""
     resolved = _safe_workspace_path(path)
@@ -383,14 +749,14 @@ async def download_file(
 
 
 @app.get("/api/gdrive/status")
-async def gdrive_status(username: str = Depends(verify_credentials)) -> JSONResponse:
+async def gdrive_status(username: str = Depends(require_auth)) -> JSONResponse:
     """Report whether Google Drive saving is configured, with setup help."""
     return JSONResponse({"enabled": _gdrive_enabled(), "hint": GDRIVE_SETUP_HINT})
 
 
 @app.post("/api/gdrive/upload")
 async def gdrive_upload(
-    payload: Dict[str, str], username: str = Depends(verify_credentials)
+    payload: Dict[str, str], username: str = Depends(require_auth)
 ) -> JSONResponse:
     """Upload one workspace output file to Google Drive.
 
@@ -447,7 +813,7 @@ def _gdrive_reset() -> None:
 # Session history: list and delete past conversations (in-memory, per process)
 # ---------------------------------------------------------------------------
 @app.get("/api/sessions")
-async def list_sessions(username: str = Depends(verify_credentials)) -> JSONResponse:
+async def list_sessions(username: str = Depends(require_auth)) -> JSONResponse:
     """List chat sessions that ran at least one task.
 
     Bare reconnects (page loads without a run) also create session objects;
@@ -469,7 +835,7 @@ async def list_sessions(username: str = Depends(verify_credentials)) -> JSONResp
 
 
 @app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str, username: str = Depends(verify_credentials)) -> JSONResponse:
+async def delete_session(session_id: str, username: str = Depends(require_auth)) -> JSONResponse:
     """Delete a session: stop a running agent, free its resources, drop history."""
     session = sessions.get(session_id)
     if session is None:
@@ -648,7 +1014,7 @@ class ModelPayload(BaseModel):
 
 
 @app.get("/api/models")
-async def list_models(username: str = Depends(verify_credentials)) -> JSONResponse:
+async def list_models(username: str = Depends(require_auth)) -> JSONResponse:
     """List selectable models (config profiles + user-added) and the active one."""
     registry = _load_registry()
     models = _builtin_entries() + _custom_entries(registry)
@@ -662,7 +1028,7 @@ async def list_models(username: str = Depends(verify_credentials)) -> JSONRespon
 
 
 @app.put("/api/models")
-async def save_model(payload: ModelPayload, username: str = Depends(verify_credentials)) -> JSONResponse:
+async def save_model(payload: ModelPayload, username: str = Depends(require_auth)) -> JSONResponse:
     """Add a custom model, or update one when payload.id matches an entry.
 
     Keys are stored in workspace/webapp_models.json (gitignored) and are
@@ -707,7 +1073,7 @@ async def save_model(payload: ModelPayload, username: str = Depends(verify_crede
 
 
 @app.delete("/api/models/{model_id}")
-async def delete_model(model_id: str, username: str = Depends(verify_credentials)) -> JSONResponse:
+async def delete_model(model_id: str, username: str = Depends(require_auth)) -> JSONResponse:
     """Delete a user-added model. Config profiles and the active model cannot be deleted."""
     registry = _load_registry()
     custom = registry.get("custom", [])
@@ -723,7 +1089,7 @@ async def delete_model(model_id: str, username: str = Depends(verify_credentials
 
 
 @app.post("/api/models/active")
-async def set_active_model(payload: Dict[str, str], username: str = Depends(verify_credentials)) -> JSONResponse:
+async def set_active_model(payload: Dict[str, str], username: str = Depends(require_auth)) -> JSONResponse:
     """Switch the active model, persist the choice, and hot-swap live agents.
 
     Args:
@@ -1058,15 +1424,30 @@ sessions: Dict[str, AgentSession] = {}
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
     """WebSocket endpoint: client sends run/stop/human_reply, server pushes events."""
-    if not verify_ws_credentials(websocket):
+    ip = _client_ip(websocket)
+    if not verify_ws_origin(websocket):
+        # No accept() yet - close is the correct rejection for a disallowed
+        # cross-origin handshake (T-2: this used to be checked nowhere).
         await websocket.close(code=1008)
         return
+    if _is_locked_out(ip) > 0 or not _resolve_ws_auth(websocket):
+        _record_auth_failure(ip)
+        await websocket.close(code=1008)
+        return
+    _record_auth_success(ip)
 
     session = sessions.setdefault(session_id, AgentSession())
     await session.connect(websocket)
     try:
         while True:
             data = await websocket.receive_text()
+            # Re-validate on every inbound message so idle/absolute session
+            # timeouts take effect on long-lived connections, not just at
+            # the initial handshake.
+            if not _resolve_ws_auth(websocket):
+                await websocket.close(code=1008)
+                await session.disconnect()
+                break
             try:
                 message = json.loads(data)
             except json.JSONDecodeError:

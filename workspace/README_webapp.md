@@ -48,7 +48,12 @@ real time.
   session; follow-up prompts continue the same conversation.
 - **Refresh-safe** — events are replayed on reconnect, so reloading the page
   mid-run loses nothing.
-- **Basic auth** — HTTP and WebSocket are protected; see configuration below.
+- **Session-based sign-in** — visiting the app shows a real login page (not
+  a native browser popup); sessions have idle (30 min) and absolute (12 h)
+  timeouts enforced server-side, plus a Sign-out button. HTTP Basic auth is
+  still accepted as a fallback for scripts/`curl`/tests. See
+  `workspace/REMOTE_ACCESS_ENGAGEMENT.md` for the full auth-hardening
+  writeup (CSRF/Origin checks, rate limiting, access logging).
 
 ## Quick start
 
@@ -62,15 +67,19 @@ printed to the console unless you set it, see below).
 
 ## Configuration (environment variables)
 
-| Variable             | Default            | Purpose                                  |
-| -------------------- | ------------------ | ---------------------------------------- |
-| `WEBAPP_AUTH_USER`   | `admin`            | Basic-auth username                      |
-| `WEBAPP_AUTH_PASS`   | random, printed    | Basic-auth password                      |
-| `WEBAPP_HOST`        | `127.0.0.1`        | Bind host                                |
-| `WEBAPP_PORT`        | `8000`             | Bind port                                |
-| `WEBAPP_MAX_STEPS`   | `30`               | Agent step limit per run                 |
+| Variable                        | Default            | Purpose                                        |
+| ------------------------------- | ------------------ | ----------------------------------------------- |
+| `WEBAPP_AUTH_USER`               | `admin`            | Login username (also accepted as HTTP Basic)    |
+| `WEBAPP_AUTH_PASS`               | random, printed    | Login password                                  |
+| `WEBAPP_HOST`                    | `127.0.0.1`        | Bind host — never change to `0.0.0.0`; put a tunnel in front instead |
+| `WEBAPP_PORT`                    | `8000`             | Bind port                                       |
+| `WEBAPP_MAX_STEPS`               | `30`               | Agent step limit per run                        |
+| `WEBAPP_ALLOWED_ORIGINS`         | localhost/127.0.0.1 (any port) | CSRF/WS-Origin allowlist — set explicitly to the public hostname once a tunnel is in front |
+| `WEBAPP_SESSION_IDLE_MINUTES`    | `30`               | Idle session timeout                            |
+| `WEBAPP_SESSION_ABSOLUTE_HOURS`  | `12`               | Absolute session lifetime                       |
+| `WEBAPP_COOKIE_SECURE`           | `0`                | Set to `1` once TLS is live in front (Tailscale Serve, etc.) |
 
-Model APIs (all basic-auth protected): `GET /api/models`, `PUT /api/models`,
+Model APIs (all auth-protected): `GET /api/models`, `PUT /api/models`,
 `DELETE /api/models/{id}`, `POST /api/models/active`.
 
 ### Google Drive saving (optional)
@@ -115,6 +124,10 @@ workspace/
 ## Security notes
 
 The agent has unrestricted Python execution, browser control, and file
-editing. The app binds to localhost by default and enforces basic auth on
-every route (including the WebSocket handshake). Set real credentials before
-exposing it through any tunnel.
+editing. The app binds to `127.0.0.1` by default and enforces authentication
+on every route including the WebSocket handshake and `/static/*`. Set real
+credentials (`WEBAPP_AUTH_PASS`) before exposing it through any tunnel, and
+set `WEBAPP_ALLOWED_ORIGINS` + `WEBAPP_COOKIE_SECURE=1` once that tunnel
+terminates TLS. See `workspace/REMOTE_ACCESS_ENGAGEMENT.md` for the full
+threat model, the remote-access plan, and why the app is never bound to
+`0.0.0.0`.
