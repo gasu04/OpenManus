@@ -343,3 +343,39 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 **Next session should:**
 - At the next natural reboot (macOS update, power event, etc.), run the 5-step checklist in §6c.
 - Everything else from prior sessions' "next steps" still applies: test acceptance test #5 from a genuinely separate device/network; commit the repo-side Phase 1/2 code changes (webapp.py, frontend, tests) to `feat/manus-web-ui` when asked — this whole engagement's actual code changes remain uncommitted.
+
+## Session: 2026-09-04 12:40
+**Goal:** Fix a real operational problem — the Phase 1 login-rate-limiter (5 failed attempts → lockout) was locking the operator out after normal password typos.
+**Completed:**
+- Also did a full browser-automation deployment check against the repo's README instructions first (Browser Use CLI 3.0 via `uvx browser-use --cli-mcp`): confirmed everything matches and works — `uvx` present, `Manus` agent auto-connects to browser-use MCP on init (verified by sending a real MCP `initialize` request directly and getting a correct skill/capabilities response), local Chrome attached via CDP on `127.0.0.1:9222`, no API key needed/set, Playwright's browsers (chromium/firefox/webkit) already installed for BrowserGym's stated prerequisite. One real discrepancy found and reported (not fixed, just flagged): `browsergym` is a declared dependency (installed in the venv) but is never imported anywhere in the actual agent code (`Manus` or `BrowserAgent` both exclusively use Browser Use CLI 3.0) — looks vestigial on this deployment, harmless.
+- Raised `RATE_LIMIT_MAX_ATTEMPTS` in `workspace/webapp.py` from 5 to 50. Reasoning: this is a single-operator deployment with a high-entropy generated password (`B7_D_cp_P3yDqDgj`) — the lockout's real job is defending against a scripted brute-force attempt, not catching a human mistyping a password a few times, and 5 was clearly too aggressive for the latter. Kept the mechanism itself (didn't remove rate limiting entirely) so a genuinely automated attack still eventually gets slowed.
+- Verified live: 8 consecutive wrong-password attempts all returned 401 (no 429 lockout, previously would have locked out after the 5th), then the correct password worked immediately after with no delay.
+- Restarted the LaunchAgent-managed webapp to apply the change (`launchctl kickstart -k`); confirmed healthy afterward.
+- Updated `workspace/REMOTE_ACCESS_ENGAGEMENT.md`'s Phase 1 changelog table to reflect the new threshold and the reasoning, so the doc doesn't silently drift from the actual deployed behavior.
+**State left in:**
+- Webapp running with the new rate-limit threshold (50 attempts). Verified via live curl drill, not just code inspection.
+- No repo commit made this session — this is a one-line constant change; left uncommitted alongside anything else pending on `feat/manus-web-ui`.
+**Files changed:**
+- workspace/webapp.py: `RATE_LIMIT_MAX_ATTEMPTS` 5 → 50.
+- workspace/REMOTE_ACCESS_ENGAGEMENT.md: Phase 1 changelog table entry updated to match.
+**Next session should:**
+- Commit this small change (plus anything else pending) to `feat/manus-web-ui` when asked.
+- Everything else from prior sessions' "next steps" still applies (test acceptance test #5 from a separate device/network; the deferred natural-reboot checklist in §6c).
+
+## Session: 2026-09-04 13:05
+**Goal:** The rate-limit fix from the previous session didn't hold — user got locked out again ("Too many attempts; retry in 706s") despite the threshold being raised to 50. Find the actual root cause.
+**Completed:**
+- Found the real bug via the access log, not guesswork: the lockout counter (`_failed_attempts`, keyed by source IP) was shared across three call sites — `POST /api/login` (correct place to rate-limit), `require_auth` (the dependency guarding *every* other API route), and the WS handshake in `websocket_endpoint`. The latter two record a "failure" on *any* 401/reject — including completely routine "not authenticated right now" traffic: an expired session's background poll, a stale browser tab's WS auto-reconnect-with-backoff loop, or just a page load before logging in. None of those involve a human (or attacker) actually guessing a password. Confirmed in the log: a 92-second gap of normal 200s on the user's device, then everything from that same IP suddenly returning 429 — with zero failed-login lines anywhere in between, meaning the WS/API-layer failures (never logged, since I'd never added access logging to the WS auth-reject path) had silently exhausted the shared budget.
+- Root-caused and fixed properly rather than just re-tuning: rate limiting now applies **only** to `POST /api/login` (the one place an actual credential guess happens). `require_auth` and the WS handshake no longer call `_record_auth_failure`/check `_is_locked_out` at all — a 401 there just means "not logged in," with no rate-limit side effect. Also fixed `_resolve_auth` itself, which previously returned `None` for *any* request (even one carrying a perfectly valid session cookie) while the IP was locked out — a real, separate bug: a lockout from stale WS noise could have blocked an already-legitimately-logged-in session too.
+- Verified: all 22 tests still pass (5 pytest smoke, 17 Playwright DOM — the DOM suite exercises real WS auth paths, so this was a meaningful regression check, not just unit-level). Restarted the LaunchAgent-managed webapp (clearing the in-memory lockout table as a side effect) and confirmed live: root and login both respond normally again (401/wrong-password respectively, no stale 429), from both localhost and the real tailnet HTTPS URL.
+- Updated `workspace/REMOTE_ACCESS_ENGAGEMENT.md`'s Phase 1 changelog entry to describe the actual bug and fix (superseding the previous session's "just raised the threshold" note, which treated a symptom, not the cause).
+**State left in:**
+- Webapp running with the corrected rate-limiting scope; lockout cleared, verified via live curl from both localhost and the tailnet URL.
+- Uncommitted — this plus the previous session's threshold change are both still pending on `feat/manus-web-ui`.
+**Files changed:**
+- workspace/webapp.py: `require_auth`, `_resolve_auth`, and `websocket_endpoint` no longer touch the login rate limiter; only `login()` does.
+- workspace/REMOTE_ACCESS_ENGAGEMENT.md: Phase 1 changelog entry rewritten to describe the real root cause.
+**Next session should:**
+- Commit both pending webapp.py changes (rate-limit threshold + this scope fix) to `feat/manus-web-ui` when asked.
+- If a lockout-like symptom ever recurs, check `logs/webapp_access.log` first for a gap-then-429 pattern like this one, rather than assuming it's mistyped passwords.
+- Everything else from prior sessions' "next steps" still applies.

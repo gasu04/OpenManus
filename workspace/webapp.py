@@ -136,7 +136,12 @@ SESSION_IDLE_SECONDS = int(os.environ.get("WEBAPP_SESSION_IDLE_MINUTES", "30")) 
 SESSION_ABSOLUTE_SECONDS = int(os.environ.get("WEBAPP_SESSION_ABSOLUTE_HOURS", "12")) * 3600
 COOKIE_SECURE = os.environ.get("WEBAPP_COOKIE_SECURE", "0") == "1"
 
-RATE_LIMIT_MAX_ATTEMPTS = 5      # failures before lockout kicks in
+RATE_LIMIT_MAX_ATTEMPTS = 50     # failures before lockout kicks in - high on
+                                 # purpose: single-operator deployment with a
+                                 # high-entropy generated password, so this
+                                 # exists only as a backstop against a truly
+                                 # automated/scripted attack, not to catch
+                                 # normal mistyped-password retries.
 RATE_LIMIT_BASE_LOCKOUT = 2.0    # seconds; doubles per additional failure
 RATE_LIMIT_MAX_LOCKOUT = 900.0   # 15 minutes, hard cap
 
@@ -312,12 +317,11 @@ def _check_basic_header(auth_header: str) -> Optional[str]:
 def _resolve_auth(request: Request) -> Optional[str]:
     """Resolve the caller's identity without raising (session cookie, then Basic).
 
-    Rate-limited: returns None immediately while the source IP is locked out,
-    without re-checking credentials (prevents a lockout from being a free
-    oracle for guessing).
+    Not rate-limited: a valid session cookie must always work regardless of
+    the login-form lockout state (see require_auth's docstring - the two
+    used to be conflated and a lockout could block an already-logged-in
+    session, which makes no sense: the cookie already proves identity).
     """
-    if _is_locked_out(_client_ip(request)) > 0:
-        return None
     username = _validate_session(request.cookies.get(SESSION_COOKIE_NAME))
     if username:
         return username
@@ -329,20 +333,27 @@ def _resolve_auth(request: Request) -> Optional[str]:
 
 
 def require_auth(request: Request) -> str:
-    """FastAPI dependency: 401s (and rate-limits failures) instead of returning None.
+    """FastAPI dependency: 401 when not authenticated.
+
+    Deliberately does NOT touch the login rate limiter: a 401 here just
+    means "no valid session/credential on this request" (an expired
+    session, a background poll before login, a stray WS-adjacent fetch) -
+    it is not evidence of a password guess. Bug fixed 2026-09-04: this used
+    to call _record_auth_failure() on every such 401, so routine
+    not-yet-authenticated traffic (page loads, model-chip polling, a stale
+    tab's background requests) silently shared the same lockout counter as
+    the login form and could lock out a real login attempt from the same
+    IP with the operator never having mistyped anything. Rate limiting now
+    lives only around POST /api/login, the one place an actual guess
+    happens.
 
     Raises:
-        HTTPException: 429 while locked out; 401 on any other auth failure.
+        HTTPException: 401 when there's no valid session or credential.
     """
-    ip = _client_ip(request)
-    remaining = _is_locked_out(ip)
-    if remaining > 0:
-        raise HTTPException(status_code=429, detail=f"Too many failed attempts; retry in {int(remaining)}s")
     username = _resolve_auth(request)
     if username:
         request.state.identity = username
         return username
-    _record_auth_failure(ip)
     raise HTTPException(status_code=401, detail="Authentication required")
 
 
@@ -1423,18 +1434,22 @@ sessions: Dict[str, AgentSession] = {}
 
 @app.websocket("/ws/{session_id}")
 async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
-    """WebSocket endpoint: client sends run/stop/human_reply, server pushes events."""
-    ip = _client_ip(websocket)
+    """WebSocket endpoint: client sends run/stop/human_reply, server pushes events.
+
+    Not rate-limited (see require_auth's docstring for the full reasoning):
+    a WS handshake without a valid session is routine (expired session,
+    reconnect-with-backoff after a network blip) and used to silently share
+    the login-form's failure counter, which could lock out a real login
+    attempt from the same IP with no password ever having been guessed.
+    """
     if not verify_ws_origin(websocket):
         # No accept() yet - close is the correct rejection for a disallowed
         # cross-origin handshake (T-2: this used to be checked nowhere).
         await websocket.close(code=1008)
         return
-    if _is_locked_out(ip) > 0 or not _resolve_ws_auth(websocket):
-        _record_auth_failure(ip)
+    if not _resolve_ws_auth(websocket):
         await websocket.close(code=1008)
         return
-    _record_auth_success(ip)
 
     session = sessions.setdefault(session_id, AgentSession())
     await session.connect(websocket)
