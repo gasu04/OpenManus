@@ -379,3 +379,24 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - Commit both pending webapp.py changes (rate-limit threshold + this scope fix) to `feat/manus-web-ui` when asked.
 - If a lockout-like symptom ever recurs, check `logs/webapp_access.log` first for a gap-then-429 pattern like this one, rather than assuming it's mistyped passwords.
 - Everything else from prior sessions' "next steps" still applies.
+
+## Session: 2026-09-04 14:10
+**Goal:** Diagnose why the last agent run failed.
+**Completed:**
+- Traced the actual run via `logs/20260904131339.log` (the current webapp process's log). Two distinct issues found:
+  1. **Real failure cause**: the run's second turn (same session, ~45 min after the first turn completed - confirmed via the step counter continuing 10→11 and `Manus.think()`'s `if not self._initialized: initialize_mcp_servers()` re-firing after `cleanup()` reset that flag at the end of turn 1, not a new session) hit `openai.AuthenticationError: Invalid Anthropic API Key` and exhausted all retries. Root-caused precisely: the active model (a custom Anthropic entry added via the Models UI) had its API key edited through `PUT /api/models` two minutes before the failure. Confirmed the *current* key on disk is completely valid (tested directly against Anthropic's API three ways: `/v1/models` GET, OpenAI-compatible `/v1/chat/completions`, and native `/v1/messages` - all 200). The actual bug: `save_model` (editing an already-active model in place) bumps the registry revision and saves the file, but — unlike `set_active_model` (switching *which* model is active) — it never pushes the refreshed LLM client into already-running agent sessions. So the in-progress session's cached `agent.llm` kept using whatever key it was built with at turn-1 start, and editing the key mid-flight never reached it — turn 2 failed with the *old*, no-longer-valid key even though the *new* one (visible in the UI) was fine.
+  2. **Second, separate bug found via the same log**: every single agent run silently fails to connect Browser Use CLI 3.0 (`Failed to connect to Browser Use CLI 3.0: [Errno 2] No such file or directory: 'uvx'`) under the actual LaunchAgent-managed webapp process, because launchd's default `PATH` (`/usr/bin:/bin:/usr/sbin:/sbin`) doesn't include `/opt/homebrew/bin` where `uvx` lives. This directly contradicts the browser-automation check from two sessions ago, which tested `uvx` from an interactive shell (Homebrew on PATH) and never actually exercised the constrained launchd environment - a real gap in that check's coverage, caught here by accident while investigating something else.
+- Fixed both:
+  1. `workspace/webapp.py`'s `save_model`: now hot-swaps `agent.llm` on every live session when the model being edited is the currently-active one (mirrors `set_active_model`'s existing logic exactly).
+  2. `~/openmanus-bin/start_openmanus_web.sh`: exports `PATH="/opt/homebrew/bin:$PATH"` before exec'ing into the app.
+- Verified both live, not just by inspection: restarted the LaunchAgent, ran a real end-to-end agent turn over a fresh WebSocket connection (login → run → terminate) and confirmed the new log shows `Connected to Browser Use CLI 3.0 through MCP` (previously `Failed to connect ... No such file or directory: 'uvx'`). Cleaned up the test session afterward.
+- All 22 tests (5 pytest smoke, 17 Playwright DOM) still pass after the `save_model` change.
+**State left in:**
+- Webapp running with both fixes deployed and confirmed working.
+- Uncommitted — both fixes (webapp.py change + the launch-script PATH fix, the latter outside the repo in the operator's home directory) are pending.
+**Files changed:**
+- workspace/webapp.py: `save_model` hot-swaps live sessions' LLM client when editing the currently-active model.
+- `~/openmanus-bin/start_openmanus_web.sh` (outside the repo): added Homebrew to PATH so `uvx`/Browser Use CLI 3.0 resolves under launchd.
+**Next session should:**
+- Commit the `save_model` fix to `feat/manus-web-ui` when asked.
+- If a future browser-automation check is done again, test it against the actual LaunchAgent's environment (or at minimum check its PATH), not just an interactive shell - this is exactly how the `uvx` gap went unnoticed for two sessions.

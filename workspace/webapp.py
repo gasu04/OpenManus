@@ -1080,7 +1080,24 @@ async def save_model(payload: ModelPayload, username: str = Depends(require_auth
 
     registry["revision"] = int(registry.get("revision", 0)) + 1
     _save_registry(registry)
-    return JSONResponse({"status": "ok", "message": message, "id": entry["id"]})
+
+    # Bug fixed 2026-09-04: editing the currently-active model (e.g.
+    # rotating its API key) used to only update the file on disk.
+    # set_active_model already hot-swaps live agents when the *choice* of
+    # model changes; an in-place edit of the model that's already active
+    # needs the exact same refresh, or an already-running session keeps
+    # using its original (possibly now-invalid) cached LLM client until
+    # the process restarts or the user explicitly re-selects a model -
+    # which is exactly what caused a live run to fail with "Invalid
+    # Anthropic API Key" right after the key was corrected in the UI.
+    applied = 0
+    if registry.get("active") == entry["id"]:
+        for session in sessions.values():
+            if session.agent is not None:
+                _apply_llm_to_agent(session.agent)
+                applied += 1
+
+    return JSONResponse({"status": "ok", "message": message, "id": entry["id"], "agents_updated": applied})
 
 
 @app.delete("/api/models/{model_id}")
