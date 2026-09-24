@@ -136,6 +136,13 @@ class MCPServerConfig(BaseModel):
     enabled: bool = Field(
         True, description="Whether agents should connect this server"
     )
+    env: Optional[Dict[str, str]] = Field(
+        None,
+        description="Extra environment variables for stdio servers (merged over the SDK default environment)",
+    )
+    description: Optional[str] = Field(
+        None, description="Short human description shown in the web UI"
+    )
 
 
 class MCPSettings(BaseModel):
@@ -169,6 +176,8 @@ class MCPSettings(BaseModel):
                         command=server_config.get("command"),
                         args=server_config.get("args", []),
                         enabled=server_config.get("enabled", True),
+                        env=server_config.get("env"),
+                        description=server_config.get("description"),
                     )
                 return servers
         except Exception as e:

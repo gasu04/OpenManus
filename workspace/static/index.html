@@ -211,7 +211,13 @@
           </div>
           <div class="form-grid">
             <label>Label<input type="text" id="fLabel" placeholder="My model" required /></label>
-            <label>Model ID<input type="text" id="fModel" placeholder="gpt-4o" required /></label>
+            <label>Model ID
+              <span class="model-fetch">
+                <input type="text" id="fModel" placeholder="gpt-4o" list="fModelChoices" required />
+                <button type="button" class="btn-ghost" id="fFetchModels" title="Fetch the full model list from the provider">Fetch</button>
+              </span>
+            </label>
+            <datalist id="fModelChoices"></datalist>
             <label class="span2">Base URL<input type="text" id="fBaseUrl" placeholder="https://api.openai.com/v1" required /></label>
             <label class="span2">API key<input type="password" id="fKey" placeholder="sk-..." autocomplete="off" /></label>
             <label>Max tokens<input type="number" id="fMaxTokens" value="8192" min="256" max="131072" /></label>

@@ -36,10 +36,14 @@ real time.
 - **Model management** — gear icon (or the model chip in the header) opens a
   Models dialog: switch between the profiles in `config/config.toml`, add
   custom OpenAI-compatible models with your own API keys (provider presets
-  included), edit or delete them. The active model hot-swaps into live
-  agents and applies to new sessions. Keys are stored in
-  `workspace/webapp_models.json` (gitignored), only ever shown as a hint,
-  and never logged.
+  included: OpenAI, Moonshot/Kimi, DeepSeek, Anthropic, Gemini, Z.AI, PPIO,
+  Jiekou.AI, Ollama), edit or delete them. The **Fetch** button next to the
+  Model ID field probes the provider's `/models` endpoint (server-side, via
+  `POST /api/models/available`) and fills a picker with every model the key
+  can see — the field stays free-text, so any model ID works. The active
+  model hot-swaps into live agents and applies to new sessions. Keys are
+  stored in `workspace/webapp_models.json` (gitignored), only ever shown as
+  a hint, and never logged.
 - **Task history** — the clock icon in the chat header opens a drawer listing
   past tasks (first prompt, age, running indicator). Click to switch back
   (the full conversation is replayed from the server's event log); hover to
@@ -85,13 +89,45 @@ Model APIs (all auth-protected): `GET /api/models`, `PUT /api/models`,
 ### MCP servers panel
 
 The plug icon (header) opens the **MCP servers** modal: every server from
-`config/mcp.json` plus the built-in Browser Use entry, each with a live
-status line (disabled / connects on next run / N tools live in M sessions)
-and a toggle switch. Toggling persists to `config/mcp.json` (`enabled` flag)
-and hot-applies to every live agent session — disabling removes the server's
-tools immediately, enabling reconnects without a new run or restart.
+`config/mcp.json` plus the built-in Browser Use entry, each with a short
+description, a live status line (disabled / connects on next run / N tools
+live in M sessions) and a toggle switch. Toggling persists to
+`config/mcp.json` (`enabled` flag) and hot-applies to every live agent
+session — disabling removes the server's tools immediately, enabling
+reconnects without a new run or restart.
 MCP APIs (all auth-protected): `GET /api/mcp/servers`,
 `POST /api/mcp/servers/{id}/toggle` with body `{"enabled": true|false}`.
+
+`config/mcp.json` entries support these optional fields beyond
+`type`/`command`/`args`/`url`:
+
+- `enabled` (bool, default `true`) — the toggle's persisted state.
+- `description` (string) — the one-liner shown under the server's name.
+- `env` (object) — environment variables for stdio servers, **merged over**
+  the MCP SDK default environment (`PATH`, `HOME`, … are preserved). This is
+  how API keys reach MCP servers; the file is gitignored, and env values are
+  never echoed back through the API.
+
+#### Google Workspace connector (Gmail, Chat, Calendar, Drive)
+
+Ships pre-configured but **disabled** in `config/mcp.json` (server id
+`google`, the community [`workspace-mcp`](https://github.com/taylorwilsdon/google_workspace_mcp)
+package). One-time setup (~10 min):
+
+1. Google Cloud Console → create/select a project → enable the **Gmail API**,
+   **Google Calendar API**, **Google Drive API**, and **Google Chat API**.
+2. OAuth consent screen → External → fill app info → add yourself as a test
+   user. Publish it to "In production" so refresh tokens don't expire weekly.
+3. Create an **OAuth client → Desktop application**; copy the client ID/secret.
+4. Chat only: Google Chat API → **Configuration** tab → set app name/avatar/
+   description (and note Chat needs a Workspace account, not @gmail.com).
+5. Add the credentials to the `google` entry's `env` in `config/mcp.json`:
+   `"GOOGLE_OAUTH_CLIENT_ID"`, `"GOOGLE_OAUTH_CLIENT_SECRET"`
+   (or `"GOOGLE_CLIENT_SECRET_PATH"` pointing at the downloaded JSON).
+6. Run the consent flow once from a terminal (opens a browser; tokens cache
+   to `~/.google_workspace_mcp/credentials/` and refresh headlessly after):
+   `uvx workspace-mcp --single-user --tools gmail calendar drive chat --tool-tier core`
+7. Toggle **google** on in the MCP panel — no restart needed.
 
 ### Google Drive saving (optional)
 

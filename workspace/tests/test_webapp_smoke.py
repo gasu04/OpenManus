@@ -272,7 +272,13 @@ def test_sessions_lifecycle(server):
 # ---------------------------------------------------------------- MCP API --
 _MCP_STUB = {
     "mcpServers": {
-        "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-pkg"]},
+        "alpha": {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "alpha-pkg"],
+            "env": {"ALPHA_API_KEY": "stub-secret"},
+            "description": "Alpha test server",
+        },
         "beta": {"type": "sse", "url": "http://127.0.0.1:9/sse", "enabled": False},
     }
 }
@@ -304,6 +310,8 @@ def mcp_stub(tmp_path):
                     command=sc.get("command"),
                     args=sc.get("args", []),
                     enabled=sc.get("enabled", True),
+                    env=sc.get("env"),
+                    description=sc.get("description"),
                 )
                 for sid, sc in data.get("mcpServers", {}).items()
             }
@@ -340,6 +348,12 @@ def test_mcp_servers_list(server, mcp_stub):
     assert by_id["beta"]["enabled"] is False
     assert by_id["alpha"]["summary"] == "npx -y alpha-pkg"
     assert by_id["beta"]["summary"] == "http://127.0.0.1:9/sse"
+    # descriptions surface; env values must never leak into the API (§2.4)
+    assert by_id["alpha"]["description"] == "Alpha test server"
+    assert by_id["beta"]["description"] == ""
+    assert by_id["browser_use"]["description"]
+    assert all("env" not in s for s in body["servers"])
+    assert "stub-secret" not in json.dumps(body)
 
 
 def test_mcp_toggle_persists_and_unknown_server_404(server, mcp_stub):
@@ -406,3 +420,47 @@ def test_mcp_toggle_hot_applies_to_live_session(server, mcp_stub):
         assert ("connect", "beta", "http://127.0.0.1:9/sse") in stub.calls
     finally:
         webapp.sessions.pop(sid, None)
+
+
+def test_mcp_env_merged_over_sdk_default():
+    # app.tool.mcp._merged_env: config env must EXTEND the SDK default env
+    # (PATH et al.), not replace it - otherwise spawned npx/uvx lose PATH.
+    from app.tool.mcp import _merged_env
+
+    assert _merged_env(None) is None
+    assert _merged_env({}) is None
+    merged = _merged_env({"MY_KEY": "secret"})
+    assert merged["MY_KEY"] == "secret"
+    assert "PATH" in merged and "HOME" in merged
+    overridden = _merged_env({"PATH": "/custom/bin"})
+    assert overridden["PATH"] == "/custom/bin"
+
+
+def test_models_available_endpoint(server, monkeypatch):
+    port = server
+    calls = []
+
+    async def fake_fetch(base_url, api_key):
+        calls.append((base_url, api_key))
+        if "fail" in base_url:
+            raise LookupError("provider returned HTTP 401")
+        return ["model-a", "model-b"]  # stub pre-sorted; sorting is _fetch's job
+
+    monkeypatch.setattr(webapp, "_fetch_provider_models", fake_fetch)
+
+    status, _ = http("POST", "/api/models/available", {"base_url": "https://api.example.com/v1"}, auth=None, port=port)
+    assert status == 401  # auth enforced
+
+    status, body = http("POST", "/api/models/available", {"base_url": "https://api.example.com/v1", "api_key": "k"}, port=port)
+    assert status == 200 and body["models"] == ["model-a", "model-b"] and body["count"] == 2
+    assert calls[-1] == ("https://api.example.com/v1", "k")
+
+    # SSRF guard: plain http is only allowed for loopback providers
+    status, _ = http("POST", "/api/models/available", {"base_url": "http://169.254.169.254/latest"}, port=port)
+    assert status == 400
+    status, body = http("POST", "/api/models/available", {"base_url": "http://localhost:11434/v1"}, port=port)
+    assert status == 200
+
+    # provider error maps to 502 without leaking internals
+    status, body = http("POST", "/api/models/available", {"base_url": "https://fail.example.com"}, port=port)
+    assert status == 502 and "401" in body["detail"]

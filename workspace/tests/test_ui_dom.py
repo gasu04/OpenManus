@@ -294,7 +294,12 @@ def test_p2_history_filter_hides_non_matching_rows(page):
 # ------------------------------------------------------------- MCP modal --
 _MCP_STUB = {
     "mcpServers": {
-        "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-pkg"]},
+        "alpha": {
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "alpha-pkg"],
+            "description": "Alpha test server",
+        },
         "beta": {"type": "sse", "url": "http://127.0.0.1:9/sse", "enabled": False},
     }
 }
@@ -324,6 +329,8 @@ def mcp_stub(tmp_path_factory):
                     command=sc.get("command"),
                     args=sc.get("args", []),
                     enabled=sc.get("enabled", True),
+                    env=sc.get("env"),
+                    description=sc.get("description"),
                 )
                 for sid, sc in data.get("mcpServers", {}).items()
             }
@@ -356,6 +363,8 @@ def test_mcp_modal_lists_and_toggles(page, mcp_stub):
     expect(builtin.locator("input")).to_be_checked()
     expect(page.locator('.mcp-card[data-id="beta"] input')).not_to_be_checked()
     expect(page.locator('.mcp-card[data-id="beta"]')).to_have_class(re.compile(r"\bdisabled\b"))
+    # brief description renders under the server name
+    expect(page.locator('.mcp-card[data-id="alpha"] .mcp-desc')).to_have_text("Alpha test server")
 
     # Toggle alpha off: card re-renders disabled, toast confirms, file persists.
     page.locator('.mcp-card[data-id="alpha"] .slider').click()
@@ -371,6 +380,31 @@ def test_mcp_modal_lists_and_toggles(page, mcp_stub):
     page.keyboard.press("Escape")
     expect(page.locator("#mcpModal")).to_be_hidden()
     assert errors[errors_before:] == []  # this test added no console errors
+
+
+def test_model_form_fetch_populates_datalist(page, monkeypatch):
+    """The Fetch button fills the Model ID datalist from the provider probe
+    (endpoint stubbed here; its own contract is covered in the smoke suite)."""
+    page, errors = page
+    errors_before = len(errors)
+
+    async def fake_fetch(base_url, api_key):
+        return ["kimi-k3", "kimi-k2.6", "kimi-k2.7-code"]
+
+    monkeypatch.setattr(webapp, "_fetch_provider_models", fake_fetch)
+
+    page.click("#btnSettings")
+    expect(page.locator("#modelModal")).to_be_visible()
+    page.select_option("#fPreset", label="Moonshot AI (Kimi)")
+    assert page.input_value("#fBaseUrl") == "https://api.moonshot.ai/v1"
+    page.click("#fFetchModels")
+    expect(page.locator("#formMsg")).to_contain_text("3 models available", timeout=5000)
+    options = page.locator("#fModelChoices option")
+    assert options.count() == 3
+    assert options.nth(0).get_attribute("value") == "kimi-k3"
+    page.keyboard.press("Escape")
+    expect(page.locator("#modelModal")).to_be_hidden()
+    assert errors[errors_before:] == []
 
 
 def test_logout_invalidates_the_session_server_side(page):

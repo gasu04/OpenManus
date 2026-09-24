@@ -277,6 +277,11 @@ body {
   background: var(--raised); color: var(--text-dim);
   padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
 }
+.mcp-desc {
+  font-size: 11.5px; color: var(--text-faint);
+  margin-top: 1px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .mcp-sub {
   font-size: 11.5px; color: var(--text-dim);
   font-family: var(--mono);
@@ -304,6 +309,10 @@ body {
 .switch input:checked + .slider::before { transform: translateX(16px); }
 .switch input:disabled + .slider { opacity: 0.5; cursor: wait; }
 .switch input:focus-visible + .slider { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.model-fetch { display: flex; gap: 6px; align-items: center; }
+.model-fetch input { flex: 1; min-width: 0; }
+.model-fetch .btn-ghost { flex: none; padding: 6px 10px; font-size: 12px; }
 
 .form-head { font-size: 13px; font-weight: 650; margin-bottom: 8px; }
 .form-row { margin-bottom: 8px; }

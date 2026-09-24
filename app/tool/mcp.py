@@ -3,12 +3,26 @@ from typing import Dict, List, Optional
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.sse import sse_client
-from mcp.client.stdio import stdio_client
+from mcp.client.stdio import get_default_environment, stdio_client
 from mcp.types import ImageContent, ListToolsResult, TextContent
 
 from app.logger import logger
 from app.tool.base import BaseTool, ToolResult
 from app.tool.tool_collection import ToolCollection
+
+
+def _merged_env(env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """Merge caller-supplied env over the MCP SDK default environment.
+
+    StdioServerParameters treats a provided env as the child's COMPLETE
+    environment, and the SDK default is only 6 vars (HOME, LOGNAME, PATH,
+    SHELL, TERM, USER) - so passing {"API_KEY": ...} bare would strip PATH
+    and the spawned npx/uvx would not even be found. Merging keeps the
+    defaults and lets config values override individual keys.
+    """
+    if not env:
+        return None
+    return {**get_default_environment(), **env}
 
 
 class MCPClientTool(BaseTool):
@@ -105,7 +119,9 @@ class MCPClients(ToolCollection):
         exit_stack = AsyncExitStack()
         self.exit_stacks[server_id] = exit_stack
 
-        server_params = StdioServerParameters(command=command, args=args, env=env)
+        server_params = StdioServerParameters(
+            command=command, args=args, env=_merged_env(env)
+        )
         stdio_transport = await exit_stack.enter_async_context(
             stdio_client(server_params)
         )

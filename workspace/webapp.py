@@ -46,6 +46,7 @@ Tier 2 (failure is loud: HTTP/WS errors surface in the browser and logs).
 
 import asyncio
 import base64
+import httpx
 import json
 import logging
 import mimetypes
@@ -906,10 +907,11 @@ MODELS_FILE = Path(__file__).parent / "webapp_models.json"
 
 PROVIDER_PRESETS: List[Dict[str, str]] = [
     {"label": "OpenAI", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
-    {"label": "DeepSeek", "base_url": "https://api.deepseek.com", "model": "deepseek-chat"},
+    {"label": "Moonshot AI (Kimi)", "base_url": "https://api.moonshot.ai/v1", "model": "kimi-k3"},
+    {"label": "DeepSeek", "base_url": "https://api.deepseek.com", "model": "deepseek-flash"},
     {"label": "Anthropic", "base_url": "https://api.anthropic.com/v1/", "model": "claude-sonnet-4-5-20250929"},
     {"label": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "model": "gemini-2.0-flash"},
-    {"label": "Z.AI", "base_url": "https://api.z.ai/api/paas/v4/", "model": "glm-4.5"},
+    {"label": "Z.AI", "base_url": "https://api.z.ai/api/paas/v4/", "model": "glm-4.6"},
     {"label": "PPIO", "base_url": "https://api.ppinfra.com/v3/openai", "model": "deepseek/deepseek-v3-0324"},
     {"label": "Jiekou.AI", "base_url": "https://api.jiekou.ai/openai", "model": "claude-sonnet-4-5-20250929"},
     {"label": "Ollama (local)", "base_url": "http://localhost:11434/v1", "model": "qwen3:8b"},
@@ -1179,6 +1181,86 @@ async def set_active_model(payload: Dict[str, str], username: str = Depends(requ
     return JSONResponse({"status": "ok", "active": model_id, "model": llm.model, "agents_updated": applied})
 
 
+class ModelsQueryPayload(BaseModel):
+    """Validated body for probing a provider's /models list."""
+
+    base_url: str = Field(..., min_length=1, max_length=300)
+    api_key: str = Field("", max_length=300)
+    id: Optional[str] = Field(
+        None, description="Existing registry entry id; uses its stored key when api_key is blank"
+    )
+
+
+def _validate_provider_url(base_url: str) -> str:
+    """Normalize and guard the provider URL (SSRF hygiene for an authed endpoint).
+
+    https is required everywhere except loopback (local providers like Ollama).
+    """
+    from urllib.parse import urlparse
+
+    url = base_url.strip().rstrip("/")
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        return url
+    if parsed.scheme == "http" and host in {"localhost", "127.0.0.1", "::1"}:
+        return url
+    raise HTTPException(
+        status_code=400,
+        detail="base_url must be https (http is only allowed for localhost providers)",
+    )
+
+
+async def _fetch_provider_models(base_url: str, api_key: str) -> List[str]:
+    """GET {base_url}/models and return the list of model ids.
+
+    Runs server-side so the browser never talks to the provider directly
+    (CORS) and the key never appears in page-visible network logs. Extracted
+    as a module-level function so tests can stub the network call.
+    """
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        resp = await client.get(f"{base_url}/models", headers=headers)
+    if resp.status_code != 200:
+        raise LookupError(f"provider returned HTTP {resp.status_code}")
+    data = resp.json()
+    ids = [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+    return sorted(ids)[:500]
+
+
+@app.post("/api/models/available")
+async def list_provider_models(
+    payload: ModelsQueryPayload, username: str = Depends(require_auth)
+) -> JSONResponse:
+    """List every model a provider offers for the model-form's picker.
+
+    When payload.id names an existing registry entry and no api_key is sent,
+    the entry's stored key is used (so editing a model doesn't require
+    re-pasting its key). The key is used once, never logged, never echoed.
+    """
+    base_url = _validate_provider_url(payload.base_url)
+    api_key = payload.api_key.strip()
+    if not api_key and payload.id:
+        entry = _find_entry(payload.id)
+        if entry:
+            api_key = (entry.get("api_key") or "").strip()
+    try:
+        ids = await _fetch_provider_models(base_url, api_key)
+    except HTTPException:
+        raise
+    except LookupError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    except Exception as e:
+        # Never include the URL's credentials or the key in errors/logs (§2.4).
+        logger.warning(
+            f"Model list fetch failed for {base_url.split('/')[2] if '/' in base_url else base_url}: {type(e).__name__}"
+        )
+        raise HTTPException(
+            status_code=502, detail=f"could not fetch model list ({type(e).__name__})"
+        )
+    return JSONResponse({"models": ids, "count": len(ids)})
+
+
 # ---------------------------------------------------------------------------
 # MCP server registry: list + toggle (persisted in config/mcp.json, hot-applied
 # to live agent sessions - same pattern as the model hot-swap above)
@@ -1219,6 +1301,13 @@ def _server_summary(server_config: Any) -> str:
     return _SECRET_ARG_RE.sub(r"\1=***", cmdline)
 
 
+# Fallback descriptions for servers with no mcp.json entry (or none set there);
+# any server can override by adding "description" to its mcp.json object.
+_MCP_DESCRIPTIONS: Dict[str, str] = {
+    _BROWSER_USE_SERVER_ID: "Built-in browser automation (Browser Use CLI 3.0)",
+}
+
+
 def _mcp_server_entries() -> List[Dict[str, Any]]:
     """All known servers: the built-in browser_use plus mcp.json entries."""
     servers = config.mcp_config.servers
@@ -1235,6 +1324,11 @@ def _mcp_server_entries() -> List[Dict[str, Any]]:
             ),
             "enabled": browser_entry.enabled if browser_entry else True,
             "builtin": True,
+            "description": (
+                (browser_entry.description or _MCP_DESCRIPTIONS[_BROWSER_USE_SERVER_ID])
+                if browser_entry
+                else _MCP_DESCRIPTIONS[_BROWSER_USE_SERVER_ID]
+            ),
         }
     ]
     for server_id, server_config in servers.items():
@@ -1248,6 +1342,8 @@ def _mcp_server_entries() -> List[Dict[str, Any]]:
                 "summary": _server_summary(server_config),
                 "enabled": server_config.enabled,
                 "builtin": False,
+                "description": server_config.description
+                or _MCP_DESCRIPTIONS.get(server_id, ""),
             }
         )
     return entries
@@ -1298,7 +1394,9 @@ async def _connect_mcp_on_agent(agent: Manus, server_id: str, servers: Dict[str,
             stdio_args=server_config.args,
             tool_name_prefix=server_id != _BROWSER_USE_SERVER_ID,
             stdio_env=(
-                _browser_use_env() if server_id == _BROWSER_USE_SERVER_ID else None
+                _browser_use_env()
+                if server_id == _BROWSER_USE_SERVER_ID
+                else server_config.env
             ),
         )
 

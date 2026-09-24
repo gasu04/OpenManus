@@ -1294,10 +1294,38 @@
     $("modelForm").reset();
     $("fMaxTokens").value = 8192;
     $("fTemp").value = "0.0";
+    $("fModelChoices").innerHTML = "";
     $("formCancel").classList.add("hidden");
     $("formHead").textContent = "Add a model";
     $("formSave").textContent = "Save model";
   }
+
+  // Pull the provider's full model list into the Model ID datalist (the field
+  // stays free-text; the list is just every model the key can see).
+  $("fFetchModels").onclick = async () => {
+    const btn = $("fFetchModels");
+    btn.disabled = true;
+    try {
+      const res = await fetch("/api/models/available", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          base_url: $("fBaseUrl").value.trim(),
+          api_key: $("fKey").value.trim(),
+          id: editingId || undefined,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) { formMsg(data.detail || "Fetch failed", true); return; }
+      $("fModelChoices").innerHTML = data.models.map((m) => `<option value="${esc(m)}">`).join("");
+      formMsg(data.count ? `${data.count} models available — pick from the list or type any ID` : "Provider returned no models");
+      if (data.count) $("fModel").focus();
+    } catch {
+      formMsg("Fetch failed (server unreachable)", true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
 
   function startEdit(m) {
     editingId = m.id;
@@ -1393,6 +1421,7 @@
         <span class="mcp-dot ${state}" aria-hidden="true"></span>
         <div class="mcp-info">
           <div class="mcp-name">${esc(s.label)}${s.builtin ? '<span class="mcp-badge">built-in</span>' : ""}</div>
+          ${s.description ? `<div class="mcp-desc">${esc(s.description)}</div>` : ""}
           <div class="mcp-sub" title="${esc(s.summary)}">${esc(s.summary)}</div>
           <div class="mcp-status">${esc(mcpStatusText(s))}</div>
         </div>
