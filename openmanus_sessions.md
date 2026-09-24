@@ -530,3 +530,52 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - openmanus_sessions.md: this entry.
 **Next session should:**
 - Commit the cache fix when the user asks (message suggestion: "fix(web): bust heuristic browser caching of static assets").
+
+## Session: 2026-09-24 13:05
+**Goal:** Web research (read-only, no code changes): verify OpenAI-compatible integration facts for Moonshot/Kimi, DeepSeek, z.ai against live official docs.
+**Completed:**
+- Fetched live official docs: platform.kimi.ai (Moonshot intl), platform.kimi.com (Moonshot CN, api.moonshot.cn confirmed), api-docs.deepseek.com, docs.z.ai (+ its openapi.json).
+- Live unauthenticated probes: GET /models on all providers returns 401 (routes exist, Bearer required); z.ai /models is undocumented but exists (401, not 404); api.deepseek.com/v1/models also 401 (v1 alias routes).
+- Key findings vs user's premises: Kimi flagship is now kimi-k3 (1M ctx) + kimi-k2.7-code/kimi-k2.6 (256K); moonshot-v1-* & kimi-k2-* all deprecated 2026. DeepSeek deepseek-chat/deepseek-reasoner DISCONTINUED 2026-07-24; current: deepseek-flash (V4.1-Flash) + deepseek-v4-pro (V4-Pro-0813), 1M ctx. z.ai current is GLM-5.3/5.3-Flash/5.2 (GLM-5.3: 1M ctx, 128K out); glm-4.5/4.6 still available but no longer flagship; GLM-4.5-Flash & GLM-4.7-Flash free.
+**State left in:** Nothing running, nothing broken. No repo files touched except this journal. Full report delivered in chat.
+**Files changed:**
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- If user wants these wired into OpenManus config: base URLs are https://api.moonshot.ai/v1, https://api.deepseek.com, https://api.z.ai/api/paas/v4/ — model IDs per the report (do NOT use moonshot-v1-*, deepseek-chat, or deepseek-reasoner).
+
+## Session: 2026-09-24 (research)
+**Goal:** Web research (read-only): verify integration facts for taylorwilsdon/google_workspace_mcp against live sources (GitHub API, PyPI, README, docs site, source code).
+**Completed:**
+- Verified PyPI workspace-mcp v1.28.0 (2026-09-21); repo 3,221 stars, last push 2026-09-23, MIT, very active.
+- Read main.py, auth/{oauth_config,client_secrets,credential_store,google_auth,scopes,port_resolver}.py from live main branch to nail CLI flags, auth env vars, token storage path, consent flow mechanics, port fallback (8000-8004).
+- Confirmed chat IS a --tools family (12 services total); Chat needs Chat-app Configuration tab + Workspace account (FAQ).
+- Confirmed no official Google MCP for gmail/calendar/drive/chat: googleworkspace org has 2 archived MCP repos (developer-mcp, dev-assist) + flagship Rust CLI (31k stars, not MCP).
+- Full structured report with config snippet + bootstrap steps delivered in chat.
+**State left in:** Nothing running, nothing broken. No repo files touched except this journal.
+**Files changed:**
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- If user proceeds: wire the recommended stdio config (uvx workspace-mcp --single-user --tools gmail calendar drive chat) into the agent framework; operator must do Cloud Console OAuth bootstrap first (steps in report).
+
+## Session: 2026-09-24 15:20
+**Goal:** Add Google Workspace connectors (Gmail/Chat/Calendar/Drive), brief descriptions in the MCP panel list, and finish the model-provider task (Moonshot/DeepSeek/z.ai + select-any-model).
+**Completed:**
+- Researched google_workspace_mcp (taylorwilsdon, 3.2k stars, PyPI workspace-mcp 1.28.0): stdio default, --single-user --tools gmail calendar drive chat --tool-tier core; OAuth via GOOGLE_OAUTH_CLIENT_ID/SECRET env or GOOGLE_CLIENT_SECRET_PATH; tokens cache to ~/.google_workspace_mcp/credentials/ and run headless after one interactive consent; Chat needs Workspace account + Chat API Configuration tab.
+- Implemented MCP env passthrough (was flagged as required last session): MCPServerConfig.env + description fields (app/config.py); _merged_env() in app/tool/mcp.py merges config env OVER the SDK default env (passing env bare would strip PATH from the child); manus.py + webapp._connect_mcp_on_agent pass server_config.env through.
+- MCP panel descriptions: description flows from mcp.json (fallback map for browser_use) into GET /api/mcp/servers and renders under each server name; env values are never echoed by the API (tested). mcp.json updated with descriptions for all servers + the google entry (uvx workspace-mcp, enabled:false pending OAuth bootstrap by the operator; OAUTHLIB_INSECURE_TRANSPORT=1 preset). config/mcp.example.json documents env/description.
+- Model providers (completing the interrupted task): Moonshot AI (Kimi) preset added (kimi-k3, api.moonshot.ai/v1); DeepSeek preset updated deepseek-chat -> deepseek-flash (deepseek-chat was discontinued 2026-07-24 per DeepSeek changelog); Z.AI preset updated glm-4.5 -> glm-4.6. New POST /api/models/available probes a provider's /models server-side (https-only except loopback SSRF guard, 10s timeout, 500-id cap, stored-key lookup by entry id, keys never logged/echoed); the model form's Fetch button fills a datalist on the still-free-text Model ID input.
+- Tests: 31/31 pass (smoke 12 incl. env-merge unit + endpoint contract + no-env-leak assertions; DOM 19 incl. description render + fetch-datalist form test).
+- Live verification: panel lists 7 servers with descriptions, google disabled with setup note (screenshot); Moonshot preset prefills + Fetch button present (screenshot); REAL provider probe: z.ai returned 11 live models via the stored-key path; Anthropic correctly errors (not OpenAI-compatible — Bearer rejected, HTTP 400 mapped to clean 502).
+**State left in:**
+- Webapp restarted with everything live. google connector awaits the operator's one-time OAuth bootstrap (steps in workspace/README_webapp.md), then just toggle on. NOTE: the active default model profile in config.toml is deepseek-chat, which DeepSeek officially retired (still routing today — switch to deepseek-flash when convenient; config.toml edit left to the operator since it holds credentials).
+**Files changed:**
+- app/config.py: MCPServerConfig env + description. app/tool/mcp.py: _merged_env. app/agent/manus.py: pass server env.
+- workspace/webapp.py: provider presets (+Moonshot, updated DeepSeek/Z.AI), /api/models/available + _fetch_provider_models + _validate_provider_url, MCP entry descriptions.
+- workspace/static/{index.html,app.js,style.css}: Fetch button + datalist, mcp-desc rendering.
+- config/mcp.example.json: env/description example. workspace/README_webapp.md: env/description fields + Google setup + models Fetch. Tests updated in both suites.
+- config/mcp.json (gitignored, local): descriptions + google entry.
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Operator completes Google OAuth bootstrap (README steps 1-6), then enables the google toggle; verify a live gmail/calendar tool call through an agent run.
+- Commit this batch when asked (suggested split: feat MCP env+descriptions+google / feat models providers+fetch).
+- Consider updating config.toml deepseek-chat -> deepseek-flash with the operator's go-ahead.
