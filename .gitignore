@@ -205,5 +205,8 @@ cython_debug/
 # OSX
 .DS_Store
 
+# Playwright MCP server runtime output (snapshots/console logs written to cwd)
+.playwright-mcp/
+
 # node
 node_modules

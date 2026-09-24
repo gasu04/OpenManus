@@ -1,2 +1,4 @@
 # prevent the local config file from being uploaded to the remote repository
 config.toml
+# local MCP server registry (may hold machine-specific commands/keys)
+mcp.json
