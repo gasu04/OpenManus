@@ -400,3 +400,117 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 **Next session should:**
 - Commit the `save_model` fix to `feat/manus-web-ui` when asked.
 - If a future browser-automation check is done again, test it against the actual LaunchAgent's environment (or at minimum check its PATH), not just an interactive shell - this is exactly how the `uvx` gap went unnoticed for two sessions.
+
+## Session: 2026-09-22 21:39
+**Goal:** Update the local repo with the latest version from upstream GitHub (FoundationAgents/OpenManus).
+**Completed:**
+- Fetched from `origin` (upstream); pruned 3 stale dependabot remote-tracking branches deleted upstream.
+- Verified against the GitHub API that upstream `main` HEAD is `3309bf4` (2026-08-16, "fix(deps): add missing structlog and cap pillow below 11") — unchanged since the last local sync.
+- Confirmed local `main` is 1 commit *ahead* of upstream (`6164e51`, local CLAUDE.md/session-log commit) and 0 behind; `feat/manus-web-ui` is 6 ahead of main, 0 behind. Checked all remote branches: nothing newer than unmerged dependabot bumps from 2026-08-22.
+- Result: already up to date — no merge/rebase performed (none needed).
+**State left in:**
+- Repo unchanged; on `feat/manus-web-ui`, clean except pre-existing untracked files (chain_of_thought_and_tasks.md, openmanus_top10_agents_plugins.md, two workspace/*.md reports).
+**Files changed:**
+- openmanus_sessions.md: appended this session entry.
+**Next session should:**
+- Nothing pending on the update front; if upstream activity resumes, a plain `git fetch origin` + fast-forward of `main` will suffice.
+
+## Session: 2026-09-22 21:55
+**Goal:** Web research (no code changes): find/verify the best maintained MCP servers for deep-research workflows to complement OpenManus's built-in tools.
+**Completed:**
+- Verified ~15 candidate MCP servers against live GitHub API, npm registry, PyPI READMEs, and official docs (all links/versions/stars current as of 2026-09-22).
+- Key findings: official Brave reference server DEPRECATED (replaced by first-party brave/brave-search-mcp-server); Perplexity official repo is perplexityai/modelcontextprotocol (@perplexity-ai/mcp-server npm); Jina now has an official remote MCP (jina-ai/MCP, https://mcp.jina.ai/v1); Firecrawl repo moved to firecrawl/firecrawl-mcp-server; gpt-researcher's MCP moved to assafelovic/gptr-mcp (quiet since 2025-11).
+- Confirmed OpenManus integration constraints from source: config/mcp.json supports only type stdio|sse, NO per-server env field (stdio children inherit process env — API keys must be exported, e.g. in the launch script), and sse = legacy SSE transport with no headers, so Streamable-HTTP-only hosted endpoints (Exa/Tavily/Perplexity/Jina/Bright Data/Firecrawl) need local stdio or an mcp-remote bridge.
+- Delivered the full structured markdown report as the final message (top 3: Exa, Perplexity, Jina).
+**State left in:**
+- Nothing running, nothing broken; repo untouched except this journal entry.
+**Files changed:**
+- openmanus_sessions.md: appended this session entry.
+**Next session should:**
+- If the user wants to adopt any picks, create/edit config/mcp.json (stdio entries) and add API-key exports to the launch script; remember stdio MCP servers get env only via process inheritance.
+
+## Session: 2026-09-22 23:05
+**Goal:** Web research: verify the best currently-maintained MCP servers for website construction with OpenManus.
+**Completed:**
+- Verified via GitHub API/npm/official docs: Playwright MCP (@playwright/mcp 0.0.82, 37.5k stars), shadcn MCP (`npx shadcn@latest mcp`, official), Figma MCP (remote https://mcp.figma.com/mcp, OAuth), Vercel MCP (https://mcp.vercel.com, OAuth, approved-clients only), Netlify MCP (`npx -y @netlify/mcp` v1.15.1 — old `netlify-mcp` npm package UNPUBLISHED 2026-01-12), v0 MCP (https://v0.app/api/mcp via mcp-remote, OAuth), 21st.dev (Magic MCP renamed "21st MCP", remote https://21st.dev/api/mcp + legacy stdio proxy @21st-dev/magic), filesystem reference server (@modelcontextprotocol/server-filesystem v2026.8.31), designlang newcomer (npx -y designlang mcp; npm 12.21.0 lags repo v13.x).
+- Confirmed NOT real/absent: official Builder.io MCP, official Framer MCP, official Tailwind MCP (community ones tiny/stale). Webflow MCP real but semi-stale (last push 2026-06-09).
+- Audited OpenManus MCP client: `config/mcp.json` supports type stdio/sse only; MCPServerConfig has NO `env` field (stdio servers inherit the launching process env — relevant for the launchd install) and SSE client (app/tool/mcp.py) has no headers/OAuth → remote OAuth MCPs need `npx mcp-remote <url>` as a stdio bridge (mcp-remote 0.14.3 verified).
+**State left in:**
+- No code changed. Full report delivered to user with config snippets.
+**Files changed:**
+- openmanus_sessions.md: appended this session entry.
+**Next session should:**
+- If asked to wire these up: create `config/mcp.json` (copy from `config/mcp.example.json`), export any API keys in the LaunchAgent/shell environment (no per-server env support), and test OAuth bridges (mcp-remote) interactively first since the first connect opens a browser.
+
+## Session: 2026-09-22 22:15
+**Goal:** Web research: find/verify best maintained MCP servers for mobile app development with OpenManus (Expo, Flutter/Dart, XcodeBuildMCP, mobile-mcp, Maestro, adb, Supabase, Firebase, Appium).
+**Completed:**
+- Verified all candidates live via GitHub API, npm registry, and official docs (no code changes).
+- Key corrections found: mobile-mcp lives at mobile-next/mobile-mcp (mobilenexthq 404s); XcodeBuildMCP moved to getsentry org; mobile-dev-inc/maestro-mcp is ARCHIVED (Maestro CLI now bundles `maestro mcp`); @expo/mcp-server does not exist — Expo MCP is remote HTTP+OAuth at https://mcp.expo.dev/mcp; Firebase MCP is `npx -y firebase-tools@latest mcp`; official Flutter/Dart MCP is `dart mcp-server`; official Appium MCP is npm `appium-mcp` v1.94.3 (Node >=22); Supabase MCP repo is supabase/mcp, npm @supabase/mcp-server-supabase@0.13.0.
+- Confirmed OpenManus config/mcp.json supports only stdio (command+args) and sse (url); MCPServerConfig has NO per-server env field — credentials must be inherited from the process env.
+- Wrote full verified report (8 ranked picks + dead ends + bottom line) to workspace/mobile_mcp_servers_report.md.
+**State left in:**
+- Nothing running; repo otherwise unchanged (untracked report + this log entry).
+**Files changed:**
+- workspace/mobile_mcp_servers_report.md: new verified research report on mobile-dev MCP servers.
+- openmanus_sessions.md: appended this session entry.
+**Next session should:**
+- If the user wants to act on the report: add mobile-mcp + XcodeBuildMCP (+ Expo via mcp-remote bridge or `dart mcp-server` for Flutter) to config/mcp.json and test tool connectivity.
+
+## Session: 2026-09-22 23:40
+**Goal:** Research OpenManus plugins/complements for deep research, website construction, and mobile app development.
+**Completed:**
+- Audited the local extension mechanism: `config/mcp.json` (mcpServers format, stdio command+args or sse url; NO per-server env field — keys must be exported in the launch environment); SSE client has no headers/OAuth, so hosted Streamable-HTTP/OAuth MCPs (Figma, Vercel, Expo, Supabase, Jina) need a `npx -y mcp-remote <url>` stdio bridge.
+- Ran 4 parallel verified web-research sweeps (deep research, website construction, mobile dev, OpenManus ecosystem + general MCPs); all candidates checked live against GitHub API/npm/official docs. Subagents logged their own session entries (22:15 mobile, 23:05 website).
+- Key ecosystem finding: there is NO thriving OpenManus plugin ecosystem (no plugin API; forks/extensions mostly dead since 2025). Real extensibility = MCP servers. Official-org companions: OpenManus-RL, MetaGPT, AFlow, ReCode, AOrchestra (research-grade, not plugins).
+- Delivered consolidated ranked recommendations to the user (top picks: Exa/Perplexity/Jina for deep research; Playwright/shadcn/Netlify for websites; mobile-mcp/XcodeBuildMCP/Expo-or-Flutter for mobile; GitHub MCP/memory MCP/Headroom generally). Full mobile report at workspace/mobile_mcp_servers_report.md.
+**State left in:**
+- No config changes made; nothing installed. Untracked research file added under workspace/.
+**Files changed:**
+- openmanus_sessions.md: appended consolidated session entry.
+**Next session should:**
+- Ask the user which picks to adopt; then create `config/mcp.json` with stdio entries, add API-key exports to ~/openmanus-bin/start_openmanus_web.sh, and verify each server connects (check logs for "Connected to MCP server <id>").
+
+## Session: 2026-09-23 19:30
+**Goal:** Install the 5 suggested MCP servers (playwright, shadcn, memory, exa keyless, mobile) and run a full test.
+**Completed:**
+- Verified stdio env constraint empirically: MCP children receive only HOME/LOGNAME/PATH/SHELL/TERM/USER (SDK default env) — API keys CANNOT reach MCP servers without a code change (MCPServerConfig needs an env field). Starter set works fully keyless.
+- Created `config/mcp.json` with 5 stdio servers; added `mcp.json` to `config/.gitignore` (matches existing config.toml pattern; NOT committed - per no-git-mutations rule).
+- Standalone connectivity test (project's own MCPClients): 5/5 PASS — playwright 25 tools, shadcn 7, memory 9, exa 2, mobile 32 = 75 tools.
+- In-process Manus E2E: 6/6 servers connected (incl. browser_use), real LLM turn called mcp_memory_create_entities successfully. Found pre-existing framework quirk: run()'s internal MCP teardown raises CancelledError after the final answer when connect+cleanup happen in one task (webapp's own cleanup path tolerates it; NOT caused by the new servers).
+- Restarted com.openmanus.webapp LaunchAgent; production log shows all 6 "Connected to MCP server" lines.
+- Live production E2E over WebSocket (login -> run -> terminate): agent called mcp_memory_read_graph + terminate — PASS.
+- Full existing suite: 5/5 pytest smoke + 17/17 Playwright DOM (after `playwright install chromium` — browser binary cache had drifted since 2026-09-04, unrelated to MCP changes).
+**State left in:**
+- Webapp running with 6 MCP servers (75 new tools) live. Test agent session e2e-mcp-* lingers in memory until idle expiry/restart (harmless). No keys installed; Exa runs at anonymous rate limits.
+**Files changed:**
+- config/mcp.json: NEW (gitignored) — 5 stdio MCP servers.
+- config/.gitignore: ignore mcp.json.
+- openmanus_sessions.md: appended this entry.
+- ~/Library/Caches/ms-playwright: downloaded chromium_headless_shell-1161 (env repair for DOM tests).
+**Next session should:**
+- To enable paid/keyed servers (Exa with key, Perplexity, Jina, Netlify...), first add an `env: Optional[Dict[str,str]]` field to MCPServerConfig in app/config.py + pass-through in app/tool/mcp.py connect_stdio and app/agent/manus.py (SDK default env blocks all but 6 vars otherwise), then export keys in ~/openmanus-bin/webapp.env.
+- Consider fixing the run()-teardown CancelledError properly (catch BaseException in MCPClients.disconnect, or restructure exit-stack ownership) — it masks run()'s return value in single-task callers.
+- Commit config/.gitignore when the user next asks for a commit.
+
+## Session: 2026-09-24 04:45
+**Goal:** Add MCP-server visibility + toggle switches to the webapp; harden/polish; verify with Playwright and live dogfood runs.
+**Completed:**
+- Backend: `enabled` flag added to MCPServerConfig (app/config.py, parsed from mcp.json, default true); Manus.initialize_mcp_servers skips disabled servers, and an explicit browser_use enabled:false entry suppresses the built-in auto-connect (app/agent/manus.py).
+- Webapp API (workspace/webapp.py): `GET /api/mcp/servers` (config + live per-session status, credential-shaped args redacted from summaries) and `POST /api/mcp/servers/{id}/toggle` (auth'd, Origin/CSRF via existing middleware, asyncio.Lock-serialized; persists to config/mcp.json; hot-applies to every live agent session via Manus.disconnect_mcp_server / connect_mcp_server; browser_use special-cased: disable writes an enabled:false entry, enable removes it so auto-connect resumes). Response reports applied + per-session error types.
+- Frontend: plug icon in header, new MCP modal (status dot on/idle/off, command summary, tools/sessions line, iOS-style toggle switch, toast feedback, Escape/overlay close) in index.html/app.js/style.css, matching the existing theme.
+- Tests: 4 new smoke tests (list+auth, persist roundtrip, browser_use roundtrip, hot-apply on a stub live agent) + 1 DOM test (modal render, toggle off/on via .slider click, Escape); stub fixtures redirect MCP_CONFIG_PATH + MCPSettings loader so the real mcp.json is never touched. Full suite: 27/27 pass (was 22).
+- Live verification on the restarted production webapp: Playwright-driven login -> 6 cards -> shadcn off/on through the real switch with API+disk assertions (screenshots reviewed: on-theme, correct disabled rendering); dogfood WS run used mcp_playwright_browser_navigate against the app's own login page; memory hot-detach (applied=1, sessions 1->0) and hot-reattach (applied=1, 0->1, tools=9) on the same live agent with no restart — all PASS. Test sessions cleaned up afterward.
+- Housekeeping: README_webapp.md documents the panel + endpoints; .playwright-mcp/ (MCP server runtime output dir) gitignored.
+**State left in:**
+- Webapp running with the MCP panel live at https://ubik-hippocampal.taila37484.ts.net (plug icon, top bar). All servers currently enabled. UNCOMMITTED: 12 modified files (incl. config/.gitignore from the MCP-install session) pending the user's commit decision.
+**Files changed:**
+- app/config.py: MCPServerConfig.enabled field + mcp.json parsing.
+- app/agent/manus.py: skip disabled servers; browser_use enabled:false suppresses auto-connect.
+- workspace/webapp.py: MCP list/toggle endpoints + helpers (_load/_save/_reload mcp file, live status, secret-arg redaction, per-agent connect).
+- workspace/static/{index.html,app.js,style.css}: MCP modal, toggle switches, status rendering.
+- workspace/tests/test_webapp_smoke.py: +4 MCP API tests; workspace/tests/test_ui_dom.py: +1 MCP modal DOM test.
+- workspace/README_webapp.md: MCP panel section. .gitignore: .playwright-mcp/. openmanus_sessions.md: this entry.
+**Next session should:**
+- When the user asks to commit: two logical commits available — (1) MCP servers install (config/.gitignore), (2) MCP panel feature (app/config.py, manus.py, webapp.py, static, tests, README).
+- Known cosmetic gap: _tool_category() only matches bare `browser*` names, so mcp_playwright_* tools render in the generic tool pane, not the Browser pane — one-line prefix tweak if desired.
