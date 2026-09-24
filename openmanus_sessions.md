@@ -514,3 +514,19 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 **Next session should:**
 - When the user asks to commit: two logical commits available — (1) MCP servers install (config/.gitignore), (2) MCP panel feature (app/config.py, manus.py, webapp.py, static, tests, README).
 - Known cosmetic gap: _tool_category() only matches bare `browser*` names, so mcp_playwright_* tools render in the generic tool pane, not the Browser pane — one-line prefix tweak if desired.
+
+## Session: 2026-09-24 06:40
+**Goal:** Fix "MCP connector button is not active" on the live webapp.
+**Completed:**
+- Diagnosed precisely: server was serving the new app.js, but StaticFiles sends no Cache-Control (ETag/Last-Modified only) -> browsers apply heuristic freshness (~10% of file age; app.js was ~3 weeks old -> ~2 days of unvalidated reuse). The operator's browser had the NEW index.html (saw the plug button) running the OLD cached app.js (no btnMcp handler) -> inert button. Reproduced the header behavior with curl; confirmed fresh-context Playwright worked (which is why the earlier live verification missed it).
+- Fix (workspace/webapp.py): STATIC_VERSION from static-dir mtimes injected as ?v= into the app shell's asset URLs (new deploy = new cache key, forces fresh fetch), and Cache-Control: no-cache on / and /static/* responses in the existing security middleware (cheap 304 revalidation forever after).
+- Regression test test_static_cache_hardening added (versioned URLs + no-cache on shell and asset). Suite: 28/28 pass.
+- Restarted production; verified live: / serves app.js?v=1790223512 + no-cache, /static/app.js no-cache, Playwright click #btnMcp -> modal with 6 servers PASS.
+**State left in:**
+- Fix live at https://ubik-hippocampal.taila37484.ts.net. Operator needs ONE normal reload (their "/" already revalidates, since they saw the new button); a hard refresh (Cmd+Shift+R) is the guaranteed fallback. UNCOMMITTED: workspace/webapp.py + workspace/tests/test_webapp_smoke.py + this journal.
+**Files changed:**
+- workspace/webapp.py: STATIC_VERSION + _app_shell_html() versioned asset URLs; no-cache middleware for / and /static/*.
+- workspace/tests/test_webapp_smoke.py: +1 cache-hardening test.
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Commit the cache fix when the user asks (message suggestion: "fix(web): bust heuristic browser caching of static assets").
