@@ -133,6 +133,9 @@ class MCPServerConfig(BaseModel):
     args: List[str] = Field(
         default_factory=list, description="Arguments for stdio command"
     )
+    enabled: bool = Field(
+        True, description="Whether agents should connect this server"
+    )
 
 
 class MCPSettings(BaseModel):
@@ -165,6 +168,7 @@ class MCPSettings(BaseModel):
                         url=server_config.get("url"),
                         command=server_config.get("command"),
                         args=server_config.get("args", []),
+                        enabled=server_config.get("enabled", True),
                     )
                 return servers
         except Exception as e:

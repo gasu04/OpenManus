@@ -50,6 +50,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import sys
 import time
@@ -66,8 +67,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from app.agent.manus import Manus
-from app.config import LLMSettings, config
+from app.agent.manus import (
+    _BROWSER_USE_ARGS,
+    _BROWSER_USE_COMMAND,
+    _BROWSER_USE_SERVER_ID,
+    Manus,
+    _browser_use_env,
+)
+from app.config import LLMSettings, MCPSettings, config
 from app.llm import LLM
 from app.logger import logger
 from app.schema import ToolCall
@@ -1149,6 +1156,219 @@ async def set_active_model(payload: Dict[str, str], username: str = Depends(requ
                 {"action": "model_switch", "actor": "operator", "model": llm.model},
             )
     return JSONResponse({"status": "ok", "active": model_id, "model": llm.model, "agents_updated": applied})
+
+
+# ---------------------------------------------------------------------------
+# MCP server registry: list + toggle (persisted in config/mcp.json, hot-applied
+# to live agent sessions - same pattern as the model hot-swap above)
+# ---------------------------------------------------------------------------
+MCP_CONFIG_PATH = PROJECT_ROOT / "config" / "mcp.json"
+_mcp_toggle_lock = asyncio.Lock()
+
+# Redact anything that looks like an inline credential before echoing a
+# server's command line to the UI (§2.4: mcp.json args may carry KEY=value).
+_SECRET_ARG_RE = re.compile(r"(?i)(api[_-]?key|token|secret|password)=\S+")
+
+
+def _load_mcp_file() -> Dict[str, Any]:
+    """Read config/mcp.json, tolerating a missing or malformed file."""
+    try:
+        return json.loads(MCP_CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"mcpServers": {}}
+
+
+def _save_mcp_file(data: Dict[str, Any]) -> None:
+    MCP_CONFIG_PATH.write_text(json.dumps(data, indent=4) + "\n")
+
+
+def _reload_mcp_servers() -> Dict[str, Any]:
+    """Re-read mcp.json into the live config singleton (mutated in place)."""
+    servers = MCPSettings.load_server_config()
+    config.mcp_config.servers.clear()
+    config.mcp_config.servers.update(servers)
+    return servers
+
+
+def _server_summary(server_config: Any) -> str:
+    """One-line human summary of a server's transport, credentials redacted."""
+    if server_config.type == "sse":
+        return _SECRET_ARG_RE.sub(r"\1=***", server_config.url or "")
+    cmdline = " ".join([server_config.command or "", *server_config.args]).strip()
+    return _SECRET_ARG_RE.sub(r"\1=***", cmdline)
+
+
+def _mcp_server_entries() -> List[Dict[str, Any]]:
+    """All known servers: the built-in browser_use plus mcp.json entries."""
+    servers = config.mcp_config.servers
+    browser_entry = servers.get(_BROWSER_USE_SERVER_ID)
+    entries = [
+        {
+            "id": _BROWSER_USE_SERVER_ID,
+            "label": "Browser Use (built-in)",
+            "type": browser_entry.type if browser_entry else "stdio",
+            "summary": (
+                _server_summary(browser_entry)
+                if browser_entry
+                else f"{_BROWSER_USE_COMMAND} {' '.join(_BROWSER_USE_ARGS)}"
+            ),
+            "enabled": browser_entry.enabled if browser_entry else True,
+            "builtin": True,
+        }
+    ]
+    for server_id, server_config in servers.items():
+        if server_id == _BROWSER_USE_SERVER_ID:
+            continue
+        entries.append(
+            {
+                "id": server_id,
+                "label": server_id,
+                "type": server_config.type,
+                "summary": _server_summary(server_config),
+                "enabled": server_config.enabled,
+                "builtin": False,
+            }
+        )
+    return entries
+
+
+def _mcp_live_status() -> Dict[str, Dict[str, Any]]:
+    """Per-server live state across agent sessions: connection count + tools."""
+    status: Dict[str, Dict[str, Any]] = {}
+    for session in sessions.values():
+        agent = session.agent
+        if agent is None:
+            continue
+        for server_id in getattr(agent, "connected_servers", {}):
+            st = status.setdefault(server_id, {"sessions": 0, "tools": None})
+            st["sessions"] += 1
+            if st["tools"] is None:
+                st["tools"] = sum(
+                    1
+                    for t in getattr(agent.mcp_clients, "tools", [])
+                    if t.server_id == server_id
+                )
+    return status
+
+
+async def _connect_mcp_on_agent(agent: Manus, server_id: str, servers: Dict[str, Any]) -> None:
+    """Connect one server on a live agent, mirroring Manus.initialize_mcp_servers."""
+    browser_entry = servers.get(_BROWSER_USE_SERVER_ID)
+    if server_id == _BROWSER_USE_SERVER_ID and browser_entry is None:
+        await agent.connect_mcp_server(
+            _BROWSER_USE_COMMAND,
+            server_id,
+            use_stdio=True,
+            stdio_args=list(_BROWSER_USE_ARGS),
+            tool_name_prefix=False,
+            stdio_env=_browser_use_env(),
+        )
+        return
+    server_config = servers.get(server_id)
+    if server_config is None or not server_config.enabled:
+        raise ValueError(f"server {server_id} is not enabled in config")
+    if server_config.type == "sse" and server_config.url:
+        await agent.connect_mcp_server(server_config.url, server_id)
+    elif server_config.type == "stdio" and server_config.command:
+        await agent.connect_mcp_server(
+            server_config.command,
+            server_id,
+            use_stdio=True,
+            stdio_args=server_config.args,
+            tool_name_prefix=server_id != _BROWSER_USE_SERVER_ID,
+            stdio_env=(
+                _browser_use_env() if server_id == _BROWSER_USE_SERVER_ID else None
+            ),
+        )
+
+
+@app.get("/api/mcp/servers")
+async def list_mcp_servers(username: str = Depends(require_auth)) -> JSONResponse:
+    """List all MCP servers with enabled state and live connection status."""
+    live = _mcp_live_status()
+    out = []
+    for entry in _mcp_server_entries():
+        st = live.get(entry["id"], {"sessions": 0, "tools": None})
+        out.append({**entry, "connected_sessions": st["sessions"], "tools": st["tools"]})
+    return JSONResponse({"servers": out})
+
+
+class MCPTogglePayload(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/mcp/servers/{server_id}/toggle")
+async def toggle_mcp_server(
+    server_id: str, payload: MCPTogglePayload, username: str = Depends(require_auth)
+) -> JSONResponse:
+    """Enable/disable an MCP server: persist to mcp.json, then hot-apply to
+    every live agent session (connect on enable, disconnect on disable).
+
+    browser_use is special-cased: its persisted "off" state is an explicit
+    mcp.json entry with enabled=false; enabling it removes that entry so the
+    built-in auto-connect resumes (a custom-configured entry is just flipped).
+    """
+    async with _mcp_toggle_lock:
+        if server_id != _BROWSER_USE_SERVER_ID and server_id not in config.mcp_config.servers:
+            raise HTTPException(status_code=404, detail="Unknown MCP server")
+
+        data = _load_mcp_file()
+        servers_json = data.setdefault("mcpServers", {})
+        if server_id == _BROWSER_USE_SERVER_ID:
+            existing = servers_json.get(_BROWSER_USE_SERVER_ID)
+            if payload.enabled:
+                custom = existing and (
+                    existing.get("command") not in (None, _BROWSER_USE_COMMAND)
+                    or existing.get("args", list(_BROWSER_USE_ARGS)) != list(_BROWSER_USE_ARGS)
+                )
+                if custom:
+                    existing["enabled"] = True
+                else:
+                    servers_json.pop(_BROWSER_USE_SERVER_ID, None)
+            else:
+                servers_json[_BROWSER_USE_SERVER_ID] = existing or {
+                    "type": "stdio",
+                    "command": _BROWSER_USE_COMMAND,
+                    "args": list(_BROWSER_USE_ARGS),
+                }
+                servers_json[_BROWSER_USE_SERVER_ID]["enabled"] = False
+        else:
+            servers_json[server_id]["enabled"] = payload.enabled
+        _save_mcp_file(data)
+        servers = _reload_mcp_servers()
+
+        applied, errors = 0, []
+        for session in sessions.values():
+            agent = session.agent
+            if agent is None:
+                continue
+            try:
+                if payload.enabled:
+                    if server_id not in getattr(agent, "connected_servers", {}):
+                        await _connect_mcp_on_agent(agent, server_id, servers)
+                        applied += 1
+                else:
+                    if server_id in getattr(agent, "connected_servers", {}):
+                        await agent.disconnect_mcp_server(server_id)
+                        applied += 1
+            except Exception as e:
+                errors.append(type(e).__name__)
+                logger.warning(
+                    f"MCP toggle {server_id} failed on a live session: {type(e).__name__}"
+                )
+        logger.info(
+            f"MCP server {server_id} {'enabled' if payload.enabled else 'disabled'} "
+            f"by {username}; applied to {applied} live session(s)"
+        )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "server_id": server_id,
+                "enabled": payload.enabled,
+                "applied": applied,
+                "errors": errors,
+            }
+        )
 
 
 

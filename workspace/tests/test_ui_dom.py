@@ -291,6 +291,88 @@ def test_p2_history_filter_hides_non_matching_rows(page):
     page.click("#historyClose")
 
 
+# ------------------------------------------------------------- MCP modal --
+_MCP_STUB = {
+    "mcpServers": {
+        "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-pkg"]},
+        "beta": {"type": "sse", "url": "http://127.0.0.1:9/sse", "enabled": False},
+    }
+}
+
+
+@pytest.fixture(scope="module")
+def mcp_stub(tmp_path_factory):
+    """Redirect the DOM-test webapp's MCP registry to a throwaway mcp.json.
+
+    Same redirect as test_webapp_smoke's mcp_stub (file path + loader), kept
+    local because this module boots its own webapp module instance. The real
+    config/mcp.json is never read or written.
+    """
+    from app.config import MCPServerConfig
+
+    temp = tmp_path_factory.mktemp("mcpdom") / "mcp.json"
+    temp.write_text(json.dumps(_MCP_STUB))
+
+    class _FakeMCPSettings:
+        @classmethod
+        def load_server_config(cls):
+            data = json.loads(temp.read_text())
+            return {
+                sid: MCPServerConfig(
+                    type=sc["type"],
+                    url=sc.get("url"),
+                    command=sc.get("command"),
+                    args=sc.get("args", []),
+                    enabled=sc.get("enabled", True),
+                )
+                for sid, sc in data.get("mcpServers", {}).items()
+            }
+
+    orig_path = webapp.MCP_CONFIG_PATH
+    orig_settings = webapp.MCPSettings
+    orig_servers = dict(webapp.config.mcp_config.servers)
+    webapp.MCP_CONFIG_PATH = temp
+    webapp.MCPSettings = _FakeMCPSettings
+    webapp._reload_mcp_servers()
+    try:
+        yield temp
+    finally:
+        webapp.MCP_CONFIG_PATH = orig_path
+        webapp.MCPSettings = orig_settings
+        webapp.config.mcp_config.servers.clear()
+        webapp.config.mcp_config.servers.update(orig_servers)
+
+
+def test_mcp_modal_lists_and_toggles(page, mcp_stub):
+    page, errors = page
+    errors_before = len(errors)  # earlier tests leave known-benign console noise
+    page.click("#btnMcp")
+    expect(page.locator("#mcpModal")).to_be_visible()
+    cards = page.locator(".mcp-card")
+    expect(cards).to_have_count(3)  # browser_use (built-in) + alpha + beta
+
+    builtin = page.locator('.mcp-card[data-id="browser_use"]')
+    expect(builtin.locator(".mcp-badge")).to_have_text("built-in")
+    expect(builtin.locator("input")).to_be_checked()
+    expect(page.locator('.mcp-card[data-id="beta"] input')).not_to_be_checked()
+    expect(page.locator('.mcp-card[data-id="beta"]')).to_have_class(re.compile(r"\bdisabled\b"))
+
+    # Toggle alpha off: card re-renders disabled, toast confirms, file persists.
+    page.locator('.mcp-card[data-id="alpha"] .slider').click()
+    expect(page.locator(".toast").last).to_contain_text("alpha deactivated", timeout=5000)
+    expect(page.locator('.mcp-card[data-id="alpha"]')).to_have_class(re.compile(r"\bdisabled\b"))
+    expect(page.locator('.mcp-card[data-id="alpha"] .mcp-status')).to_have_text("disabled")
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["alpha"]["enabled"] is False
+
+    # Toggle back on (leave the stub clean), then close via Escape.
+    page.locator('.mcp-card[data-id="alpha"] .slider').click()
+    expect(page.locator('.mcp-card[data-id="alpha"]')).not_to_have_class(re.compile(r"\bdisabled\b"), timeout=5000)
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["alpha"]["enabled"] is True
+    page.keyboard.press("Escape")
+    expect(page.locator("#mcpModal")).to_be_hidden()
+    assert errors[errors_before:] == []  # this test added no console errors
+
+
 def test_logout_invalidates_the_session_server_side(page):
     page, _ = page
     old_cookie = next(c for c in page.context.cookies() if c["name"] == "om_session")

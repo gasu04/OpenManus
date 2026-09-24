@@ -82,6 +82,17 @@ printed to the console unless you set it, see below).
 Model APIs (all auth-protected): `GET /api/models`, `PUT /api/models`,
 `DELETE /api/models/{id}`, `POST /api/models/active`.
 
+### MCP servers panel
+
+The plug icon (header) opens the **MCP servers** modal: every server from
+`config/mcp.json` plus the built-in Browser Use entry, each with a live
+status line (disabled / connects on next run / N tools live in M sessions)
+and a toggle switch. Toggling persists to `config/mcp.json` (`enabled` flag)
+and hot-applies to every live agent session — disabling removes the server's
+tools immediately, enabling reconnects without a new run or restart.
+MCP APIs (all auth-protected): `GET /api/mcp/servers`,
+`POST /api/mcp/servers/{id}/toggle` with body `{"enabled": true|false}`.
+
 ### Google Drive saving (optional)
 
 Enabled by dropping a service-account key at

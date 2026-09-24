@@ -82,7 +82,12 @@ class Manus(ToolCallAgent):
 
     async def initialize_mcp_servers(self) -> None:
         """Initialize connections to configured MCP servers."""
-        if _BROWSER_USE_SERVER_ID not in config.mcp_config.servers and os.getenv(
+        # An explicit mcp.json entry for browser_use with enabled=false is the
+        # persisted "off" state set from the web UI toggle; absence of an entry
+        # means auto-connect (unless the env var killswitch is set).
+        browser_use_entry = config.mcp_config.servers.get(_BROWSER_USE_SERVER_ID)
+        browser_use_disabled = browser_use_entry is not None and not browser_use_entry.enabled
+        if browser_use_entry is None and not browser_use_disabled and os.getenv(
             "OPENMANUS_DISABLE_BROWSER_USE", ""
         ).lower() not in {"1", "true", "yes"}:
             try:
@@ -99,6 +104,8 @@ class Manus(ToolCallAgent):
                 logger.error(f"Failed to connect to Browser Use CLI 3.0: {e}")
 
         for server_id, server_config in config.mcp_config.servers.items():
+            if not server_config.enabled:
+                continue
             try:
                 if server_config.type == "sse":
                     if server_config.url:

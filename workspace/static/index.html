@@ -38,6 +38,7 @@
       <symbol id="i-chevron" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
       <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
       <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 17l5-5-5-5M20 12H9M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-5 5 5 5 0 0 1-5-5zM12 16v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     </defs>
   </svg>
 
@@ -61,6 +62,9 @@
           </button>
           <button class="btn-icon" id="btnHistory" title="Past tasks" aria-label="Past tasks">
             <svg class="ic"><use href="#i-history"/></svg>
+          </button>
+          <button class="btn-icon" id="btnMcp" title="MCP servers" aria-label="MCP servers">
+            <svg class="ic"><use href="#i-plug"/></svg>
           </button>
           <button class="btn-icon" id="btnSettings" title="Model settings" aria-label="Model settings">
             <svg class="ic"><use href="#i-gear"/></svg>
@@ -220,6 +224,22 @@
           </div>
           <div class="form-note">Keys are stored in <code>workspace/webapp_models.json</code> (gitignored), shown only as a hint afterwards, and never logged.</div>
         </form>
+      </div>
+    </div>
+  </div>
+
+  <!-- MCP servers modal -->
+  <div class="modal-overlay hidden" id="mcpModal">
+    <div class="modal">
+      <header class="modal-header">
+        <h2>MCP servers</h2>
+        <button class="btn-icon" id="mcpModalClose" title="Close" aria-label="Close MCP servers"><svg class="ic"><use href="#i-x"/></svg></button>
+      </header>
+      <div class="modal-body">
+        <div class="mcp-list" id="mcpList">
+          <div class="pane-empty">Loading servers...</div>
+        </div>
+        <div class="form-note">Toggling applies instantly to every live session and persists in <code>config/mcp.json</code>. Disabled servers are skipped by new agent sessions.</div>
       </div>
     </div>
   </div>

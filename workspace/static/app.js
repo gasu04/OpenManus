@@ -1358,6 +1358,95 @@
     if (e.key === "Escape" && !modal.classList.contains("hidden")) modal.classList.add("hidden");
   });
 
+  // -------------------------------------------------------- MCP servers
+  const mcpModal = $("mcpModal");
+  let mcpServers = [];
+
+  async function fetchMcpServers() {
+    const res = await fetch("/api/mcp/servers");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()).servers || [];
+  }
+
+  function mcpStatusText(s) {
+    if (!s.enabled) return "disabled";
+    if (s.connected_sessions > 0) {
+      const tools = s.tools == null ? "?" : s.tools;
+      return `${tools} tool${tools === 1 ? "" : "s"} · live in ${s.connected_sessions} session${s.connected_sessions === 1 ? "" : "s"}`;
+    }
+    return "enabled · connects on next run";
+  }
+
+  function renderMcpServers() {
+    const list = $("mcpList");
+    list.innerHTML = "";
+    if (!mcpServers.length) {
+      list.innerHTML = `<div class="pane-empty">No MCP servers configured. Add them to config/mcp.json.</div>`;
+      return;
+    }
+    for (const s of mcpServers) {
+      const state = !s.enabled ? "off" : s.connected_sessions > 0 ? "on" : "idle";
+      const card = document.createElement("div");
+      card.className = "mcp-card" + (s.enabled ? "" : " disabled");
+      card.dataset.id = s.id;
+      card.innerHTML = `
+        <span class="mcp-dot ${state}" aria-hidden="true"></span>
+        <div class="mcp-info">
+          <div class="mcp-name">${esc(s.label)}${s.builtin ? '<span class="mcp-badge">built-in</span>' : ""}</div>
+          <div class="mcp-sub" title="${esc(s.summary)}">${esc(s.summary)}</div>
+          <div class="mcp-status">${esc(mcpStatusText(s))}</div>
+        </div>
+        <label class="switch" title="${s.enabled ? "Deactivate" : "Activate"} ${esc(s.id)}">
+          <input type="checkbox" role="switch" aria-label="Toggle ${esc(s.id)}" ${s.enabled ? "checked" : ""} />
+          <span class="slider"></span>
+        </label>`;
+      const toggle = card.querySelector("input");
+      toggle.onchange = async () => {
+        const want = toggle.checked;
+        toggle.disabled = true;
+        try {
+          const res = await fetch(`/api/mcp/servers/${encodeURIComponent(s.id)}/toggle`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ enabled: want }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            showToast(data.detail || `Could not ${want ? "activate" : "deactivate"} ${s.id}`, "error");
+          } else {
+            const warn = data.errors && data.errors.length ? ` (${data.errors.length} live-session error${data.errors.length === 1 ? "" : "s"})` : "";
+            showToast(`${s.id} ${want ? "activated" : "deactivated"}${want ? "" : " — tools removed from live sessions"}${warn}`, data.errors && data.errors.length ? "error" : "info");
+          }
+        } catch {
+          showToast("Toggle failed (server unreachable)", "error");
+        }
+        try {
+          mcpServers = await fetchMcpServers();
+        } catch { /* keep stale list */ }
+        renderMcpServers();
+      };
+      list.appendChild(card);
+    }
+  }
+
+  async function openMcpModal() {
+    mcpModal.classList.remove("hidden");
+    $("mcpList").innerHTML = `<div class="pane-empty">Loading servers...</div>`;
+    try {
+      mcpServers = await fetchMcpServers();
+      renderMcpServers();
+    } catch {
+      $("mcpList").innerHTML = `<div class="pane-empty">Could not load MCP servers.</div>`;
+    }
+  }
+
+  $("btnMcp").onclick = openMcpModal;
+  $("mcpModalClose").onclick = () => mcpModal.classList.add("hidden");
+  mcpModal.addEventListener("click", (e) => { if (e.target === mcpModal) mcpModal.classList.add("hidden"); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !mcpModal.classList.contains("hidden")) mcpModal.classList.add("hidden");
+  });
+
   updateModelChip();
 
   // Keep the send button enabled only when there is text and agent is idle.

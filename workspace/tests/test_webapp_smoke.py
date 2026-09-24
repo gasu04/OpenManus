@@ -247,3 +247,142 @@ def test_sessions_lifecycle(server):
     assert status == 200
     status, _ = http("DELETE", f"/api/sessions/{del_id}", port=port)
     assert status == 404
+
+
+# ---------------------------------------------------------------- MCP API --
+_MCP_STUB = {
+    "mcpServers": {
+        "alpha": {"type": "stdio", "command": "npx", "args": ["-y", "alpha-pkg"]},
+        "beta": {"type": "sse", "url": "http://127.0.0.1:9/sse", "enabled": False},
+    }
+}
+
+
+@pytest.fixture
+def mcp_stub(tmp_path):
+    """Point the webapp's MCP registry at a throwaway mcp.json.
+
+    Two layers are redirected: the file the toggle endpoint reads/writes
+    (webapp.MCP_CONFIG_PATH) and the loader used to refresh the live config
+    singleton (webapp.MCPSettings.load_server_config). The real
+    config/mcp.json is never touched, and the global servers dict is
+    restored afterwards because app.config is shared across test modules.
+    """
+    from app.config import MCPServerConfig
+
+    temp = tmp_path / "mcp.json"
+    temp.write_text(json.dumps(_MCP_STUB))
+
+    class _FakeMCPSettings:
+        @classmethod
+        def load_server_config(cls):
+            data = json.loads(temp.read_text())
+            return {
+                sid: MCPServerConfig(
+                    type=sc["type"],
+                    url=sc.get("url"),
+                    command=sc.get("command"),
+                    args=sc.get("args", []),
+                    enabled=sc.get("enabled", True),
+                )
+                for sid, sc in data.get("mcpServers", {}).items()
+            }
+
+    orig_path = webapp.MCP_CONFIG_PATH
+    orig_settings = webapp.MCPSettings
+    orig_servers = dict(webapp.config.mcp_config.servers)
+    webapp.MCP_CONFIG_PATH = temp
+    webapp.MCPSettings = _FakeMCPSettings
+    webapp._reload_mcp_servers()
+    try:
+        yield temp
+    finally:
+        webapp.MCP_CONFIG_PATH = orig_path
+        webapp.MCPSettings = orig_settings
+        webapp.config.mcp_config.servers.clear()
+        webapp.config.mcp_config.servers.update(orig_servers)
+
+
+def _mcp_ids(body):
+    return {s["id"]: s for s in body["servers"]}
+
+
+def test_mcp_servers_list(server, mcp_stub):
+    port = server
+    status, body = http("GET", "/api/mcp/servers", auth=None, port=port)
+    assert status == 401  # auth enforced like every other API
+    status, body = http("GET", "/api/mcp/servers", port=port)
+    assert status == 200
+    by_id = _mcp_ids(body)
+    assert set(by_id) == {"browser_use", "alpha", "beta"}
+    assert by_id["browser_use"]["enabled"] is True and by_id["browser_use"]["builtin"] is True
+    assert by_id["alpha"]["enabled"] is True
+    assert by_id["beta"]["enabled"] is False
+    assert by_id["alpha"]["summary"] == "npx -y alpha-pkg"
+    assert by_id["beta"]["summary"] == "http://127.0.0.1:9/sse"
+
+
+def test_mcp_toggle_persists_and_unknown_server_404(server, mcp_stub):
+    port = server
+    status, body = http("POST", "/api/mcp/servers/alpha/toggle", {"enabled": False}, port=port)
+    assert status == 200 and body["enabled"] is False and body["applied"] == 0
+    on_disk = json.loads(mcp_stub.read_text())
+    assert on_disk["mcpServers"]["alpha"]["enabled"] is False
+    status, body = http("GET", "/api/mcp/servers", port=port)
+    assert _mcp_ids(body)["alpha"]["enabled"] is False
+
+    status, body = http("POST", "/api/mcp/servers/alpha/toggle", {"enabled": True}, port=port)
+    assert status == 200 and body["enabled"] is True
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["alpha"]["enabled"] is True
+
+    status, _ = http("POST", "/api/mcp/servers/nope/toggle", {"enabled": True}, port=port)
+    assert status == 404
+
+
+def test_mcp_toggle_browser_use_roundtrip(server, mcp_stub):
+    port = server
+    status, body = http("POST", "/api/mcp/servers/browser_use/toggle", {"enabled": False}, port=port)
+    assert status == 200 and body["enabled"] is False
+    on_disk = json.loads(mcp_stub.read_text())
+    assert on_disk["mcpServers"]["browser_use"]["enabled"] is False
+    assert _mcp_ids(http("GET", "/api/mcp/servers", port=port)[1])["browser_use"]["enabled"] is False
+
+    status, body = http("POST", "/api/mcp/servers/browser_use/toggle", {"enabled": True}, port=port)
+    assert status == 200 and body["enabled"] is True
+    # Re-enabling removes the explicit entry so the built-in auto-connect resumes.
+    assert "browser_use" not in json.loads(mcp_stub.read_text())["mcpServers"]
+
+
+def test_mcp_toggle_hot_applies_to_live_session(server, mcp_stub):
+    port = server
+
+    class LiveStubAgent:
+        def __init__(self):
+            self.connected_servers = {"alpha": "npx"}
+            self.mcp_clients = SimpleNamespace(tools=[])
+            self.calls = []
+
+        async def disconnect_mcp_server(self, server_id=""):
+            self.calls.append(("disconnect", server_id))
+            self.connected_servers.pop(server_id, None)
+
+        async def connect_mcp_server(self, server_url, server_id="", **kwargs):
+            self.calls.append(("connect", server_id, server_url))
+            self.connected_servers[server_id] = server_url
+
+    stub = LiveStubAgent()
+    sid = f"mcpstub-{uuid.uuid4().hex[:8]}"
+    session = webapp.AgentSession()
+    session.agent = stub
+    webapp.sessions[sid] = session
+    try:
+        status, body = http("POST", "/api/mcp/servers/alpha/toggle", {"enabled": False}, port=port)
+        assert status == 200 and body["applied"] == 1
+        assert ("disconnect", "alpha") in stub.calls
+        assert "alpha" not in stub.connected_servers
+
+        status, body = http("POST", "/api/mcp/servers/beta/toggle", {"enabled": True}, port=port)
+        assert status == 200 and body["applied"] == 1
+        assert ("connect", "beta", "http://127.0.0.1:9/sse") in stub.calls
+    finally:
+        webapp.sessions.pop(sid, None)
