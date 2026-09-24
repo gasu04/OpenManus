@@ -165,6 +165,26 @@ def test_health_and_auth(server):
     # Health is the one public liveness endpoint; everything else requires auth.
     status, body = http("GET", "/api/health", auth=None, port=port)
     assert status == 200 and body["status"] == "ok"
+
+
+def test_static_cache_hardening(server):
+    # Guards the "new button is inert in a returning browser" failure mode:
+    # the app shell must version its asset URLs, and both shell and assets
+    # must force revalidation (heuristic freshness otherwise lets a stale
+    # cached app.js run against a brand-new index.html).
+    port = server
+    auth = {"Authorization": "Basic " + _b64(AUTH)}
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/", headers=auth)
+    with urllib.request.urlopen(req, timeout=10) as res:
+        html = res.read().decode()
+        assert "no-cache" in res.headers.get("Cache-Control", "")
+    assert 'src="/static/app.js?v=' in html
+    assert 'href="/static/style.css?v=' in html
+
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/static/app.js", headers=auth)
+    with urllib.request.urlopen(req, timeout=10) as res:
+        assert res.status == 200
+        assert "no-cache" in res.headers.get("Cache-Control", "")
     assert http("GET", "/api/sessions", auth=None, port=port)[0] == 401
     assert http("GET", "/api/files", auth=("admin", "wrong"), port=port)[0] == 401
     status, body = http("GET", "/api/health", port=port)

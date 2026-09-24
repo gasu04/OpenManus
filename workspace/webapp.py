@@ -511,6 +511,10 @@ async def security_middleware(request: Request, call_next):
         _log_access(request, "-", 401)
         return JSONResponse({"detail": "Authentication required"}, status_code=401)
     response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        # Force revalidation on every load (ETag keeps unchanged assets a
+        # cheap 304); pairs with the versioned asset URLs in _app_shell_html.
+        response.headers["Cache-Control"] = "no-cache"
     identity = getattr(request.state, "identity", None) or "-"
     _log_access(request, identity, response.status_code)
     return response
@@ -521,6 +525,23 @@ async def security_middleware(request: Request, call_next):
 # ---------------------------------------------------------------------------
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Cache-busting token for the app shell's asset URLs. StaticFiles sends
+# ETag/Last-Modified but no Cache-Control, so browsers apply *heuristic*
+# freshness (~10% of file age) and can serve a weeks-old app.js against a
+# brand-new index.html without ever revalidating - which is exactly how a
+# freshly deployed UI feature (a new button) ends up inert in a returning
+# operator's browser. Versioned URLs make every deploy a new cache key.
+STATIC_VERSION = str(
+    int(max((p.stat().st_mtime for p in STATIC_DIR.glob("*") if p.is_file()), default=0))
+)
+_STATIC_URL_RE = re.compile(r'((?:src|href)="/static/[^"?]+)"')
+
+
+def _app_shell_html() -> str:
+    """index.html with ?v=<STATIC_VERSION> injected into static asset URLs."""
+    html = (STATIC_DIR / "index.html").read_text()
+    return _STATIC_URL_RE.sub(rf'\1?v={STATIC_VERSION}"', html)
 
 
 @app.get("/")
@@ -537,7 +558,7 @@ async def root(request: Request) -> Response:
     username = _resolve_auth(request)
     if username:
         request.state.identity = username
-        return FileResponse(str(STATIC_DIR / "index.html"))
+        return HTMLResponse(_app_shell_html())
     return HTMLResponse(LOGIN_PAGE_HTML, status_code=401)
 
 
