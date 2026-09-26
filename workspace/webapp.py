@@ -1494,13 +1494,44 @@ async def toggle_mcp_server(
 # ---------------------------------------------------------------------------
 # Agent session with streaming instrumentation
 # ---------------------------------------------------------------------------
+# Markers that a tool result is really an authorization handoff (e.g. the
+# Google Workspace MCP's "ACTION REQUIRED" message carrying a consent URL).
+# Surfaced as a dedicated UI card + host-browser open instead of letting the
+# URL drown in a tool-result blob (or worse: the agent screenshotting the
+# consent page and presenting the picture instead of the link).
+_AUTH_REQUIRED_MARKERS = (
+    "action required",
+    "authorization url",
+    "authentication needed",
+    "authorization needed",
+)
+_AUTH_URL_RE = re.compile(r"https://[^\s<>()\[\]\"']+")
+
+
+def _extract_auth_url(result: str) -> Optional[str]:
+    """Return the first URL from an authorization-handoff tool result, else None."""
+    if not result:
+        return None
+    low = result.lower()
+    if not any(marker in low for marker in _AUTH_REQUIRED_MARKERS):
+        return None
+    match = _AUTH_URL_RE.search(result)
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;:!?)]}』」")
+
+
 def _tool_category(name: str) -> str:
     """Map a tool name to a UI pane category.
 
     Browser Use CLI 3.0 exposes MCP tools (browser_exec, browser_screenshot,
     ...), so browser tools are matched by prefix as well as exact name.
     """
-    if name.startswith("browser") or name == "web_search":
+    if (
+        name.startswith("browser")
+        or name.startswith("mcp_playwright_browser")
+        or name == "web_search"
+    ):
         return "browser"
     if name == "python_execute":
         return "terminal"
@@ -1530,6 +1561,7 @@ class AgentSession:
         self.title: str = ""             # first prompt, for the history list
         self.created_at: int = 0
         self.last_active: int = 0
+        self._auth_urls_seen: set = set()  # auth_required cards already shown (dedupe)
 
     # -- websocket plumbing -------------------------------------------------
     async def connect(self, websocket: WebSocket) -> None:
@@ -1677,6 +1709,7 @@ class AgentSession:
                 "tool_end",
                 {"id": call_id, "name": name, "ok": not error, "duration_ms": duration_ms, "result": preview},
             )
+            await self._maybe_emit_auth_required(name, result or "")
 
             if name == "python_execute":
                 await self.send_event(
@@ -1690,6 +1723,32 @@ class AgentSession:
         agent.think = wrapped_think  # type: ignore[method-assign]
         agent.step = wrapped_step  # type: ignore[method-assign]
         agent.execute_tool = wrapped_execute_tool  # type: ignore[method-assign]
+
+    async def _maybe_emit_auth_required(self, tool_name: str, result: str) -> None:
+        """Surface authorization handoffs as a UI card + host-browser open.
+
+        A tool result saying "ACTION REQUIRED ... <consent URL>" must never
+        reach the operator as an unclickable blob (or as an agent-taken
+        screenshot of the page). Emit a dedicated event once per URL, and
+        best-effort open the URL in the host's default browser for the
+        operator sitting at this Mac; remote operators use the card's link.
+        """
+        url = _extract_auth_url(result)
+        if not url or url in self._auth_urls_seen:
+            return
+        self._auth_urls_seen.add(url)
+        await self.send_event("auth_required", {"url": url, "tool": tool_name})
+        if sys.platform == "darwin":
+            try:
+                await asyncio.create_subprocess_exec(
+                    "open",
+                    url,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                logger.info(f"Opened authorization URL in host browser (tool {tool_name})")
+            except Exception as e:
+                logger.warning(f"Could not open authorization URL in host browser: {type(e).__name__}")
 
     async def _handle_ask_human(self, args: Dict[str, Any]) -> str:
         """Bridge the ask_human tool to the web UI instead of blocking input().

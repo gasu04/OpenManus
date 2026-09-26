@@ -33,6 +33,14 @@ real time.
   already loaded; not a full server-side search index).
 - **Ask-human bridge** — when the agent calls `ask_human`, the question
   appears in chat with an inline reply box instead of blocking the server.
+- **Authorization cards** — when a tool result is an authorization handoff
+  (e.g. Google consent "ACTION REQUIRED" + URL), the run shows an attention
+  card with a real link *and* the server opens the URL in the host Mac's
+  browser — never an agent-taken screenshot of the consent page. Bare URLs
+  in any final answer are linkified automatically.
+- **Visible final answers** — the run's result renders as a labeled,
+  accent-bordered "Final answer" block (raw/rendered toggle + copy), not
+  just another timeline entry.
 - **Model management** — gear icon (or the model chip in the header) opens a
   Models dialog: switch between the profiles in `config/config.toml`, add
   custom OpenAI-compatible models with your own API keys (provider presets
@@ -117,17 +125,26 @@ package). One-time setup (~10 min):
 1. Google Cloud Console → create/select a project → enable the **Gmail API**,
    **Google Calendar API**, **Google Drive API**, and **Google Chat API**.
 2. OAuth consent screen → External → fill app info → add yourself as a test
-   user. Publish it to "In production" so refresh tokens don't expire weekly.
+   user. **Publish it to "In production"** — a screen left in "Testing"
+   issues refresh tokens that expire after 7 days (this exact expiry killed
+   the first token here on 2026-09).
 3. Create an **OAuth client → Desktop application**; copy the client ID/secret.
 4. Chat only: Google Chat API → **Configuration** tab → set app name/avatar/
    description (and note Chat needs a Workspace account, not @gmail.com).
 5. Add the credentials to the `google` entry's `env` in `config/mcp.json`:
    `"GOOGLE_OAUTH_CLIENT_ID"`, `"GOOGLE_OAUTH_CLIENT_SECRET"`
    (or `"GOOGLE_CLIENT_SECRET_PATH"` pointing at the downloaded JSON).
-6. Run the consent flow once from a terminal (opens a browser; tokens cache
-   to `~/.google_workspace_mcp/credentials/` and refresh headlessly after):
+   *(Already done on this machine — recovered from the previous setup's
+   stored token file.)*
+6. Consent flow: simply run any Google task in the webapp (e.g. "list my
+   calendars") — the first tool call auto-opens the browser consent page
+   while the agent's server process waits. Complete it **while that run is
+   active** (Google shows "unverified app" for Testing screens: Advanced →
+   Continue). Tokens cache to `~/.google_workspace_mcp/credentials/` and
+   refresh headlessly forever after. Terminal alternative:
    `uvx workspace-mcp --single-user --tools gmail calendar drive chat --tool-tier core`
-7. Toggle **google** on in the MCP panel — no restart needed.
+7. The connector is already toggled **on** in the MCP panel (`enabled` in
+   `config/mcp.json`).
 
 ### Google Drive saving (optional)
 

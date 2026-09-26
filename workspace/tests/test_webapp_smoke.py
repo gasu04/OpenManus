@@ -464,3 +464,22 @@ def test_models_available_endpoint(server, monkeypatch):
     # provider error maps to 502 without leaking internals
     status, body = http("POST", "/api/models/available", {"base_url": "https://fail.example.com"}, port=port)
     assert status == 502 and "401" in body["detail"]
+
+
+def test_extract_auth_url():
+    # Authorization handoffs must surface a clean URL, and only then.
+    google = (
+        "**ACTION REQUIRED: Google Authentication Needed**\n"
+        "Authorization URL: https://accounts.google.com/o/oauth2/auth?client_id=x&scope=y.\n"
+        "2. After successful authorization, retry."
+    )
+    assert (
+        webapp._extract_auth_url(google)
+        == "https://accounts.google.com/o/oauth2/auth?client_id=x&scope=y"
+    )
+    assert webapp._extract_auth_url("authentication needed: visit https://auth.example.com/consent now") == "https://auth.example.com/consent"
+    # no marker -> no card (ordinary URLs in results must not trigger it)
+    assert webapp._extract_auth_url("fetched https://example.com fine") is None
+    # marker but no URL -> nothing to link
+    assert webapp._extract_auth_url("ACTION REQUIRED but no link here") is None
+    assert webapp._extract_auth_url("") is None

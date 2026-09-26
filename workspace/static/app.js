@@ -164,10 +164,13 @@
   const markdown = (src) => {
     let text = esc(src);
     const blocks = [];
-    text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => {
-      blocks.push(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`);
-      return `\u0000B${blocks.length - 1}\u0000`;
-    });
+    const stash = (html) => ` B${blocks.push(html) - 1} `;
+    text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) =>
+      stash(`<pre><code>${code.replace(/\n$/, "")}</code></pre>`));
+    // Markdown links are stashed BEFORE bare-URL linkification so their URLs
+    // are never matched twice.
+    text = text.replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, (_, label, url) =>
+      stash(`<a href="${url}" target="_blank" rel="noopener">${label}</a>`));
     text = text
       .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
       .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
@@ -175,15 +178,22 @@
       .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
       .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<em>$2</em>")
       .replace(/`([^`\n]+)`/g, "<code>$1</code>")
-      .replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+      // Bare URLs become real links (e.g. consent URLs in tool results); the
+      // trailing character class keeps sentence punctuation out of the href.
+      .replace(
+        /(?<![/"'>=])(https?:\/\/[^\s<>"')]+[A-Za-z0-9/#~=_%&+-])/g,
+        '<a href="$1" target="_blank" rel="noopener">$1</a>'
+      )
       .replace(/^\s*[-*]\s+(.+)$/gm, "<li>$1</li>")
       .replace(/^\s*\d+\.\s+(.+)$/gm, "<li>$1</li>");
     text = text
-      .replace(/(<li>[\s\S]*?<\/li>)(?!\s*<li>)/g, "<ul>$1</ul>")
+      // Group each run of consecutive items into ONE list (was: last item got
+      // its own <ul>, leaving siblings orphaned with a visible gap).
+      .replace(/((?:<li>[\s\S]*?<\/li>\s*)+)/g, "<ul>$1</ul>")
       .split(/\n{2,}/)
       .map((p) => (/^\s*<(h\d|ul|ol|pre)/.test(p.trim()) ? p : `<p>${p.replace(/\n/g, "<br>")}</p>`))
       .join("");
-    return text.replace(/\u0000B(\d+)\u0000/g, (_, i) => blocks[+i]);
+    return text.replace(/ B(\d+) /g, (_, i) => blocks[+i]);
   };
 
   // ----------------------------------------------------- tool metadata
@@ -286,9 +296,12 @@
     const el = document.createElement("div");
     el.className = "final";
     el.innerHTML = `
-      <div class="final-toolbar">
-        <button class="final-toggle" data-mode="rendered">View raw</button>
-        ${copyBtnHtml(0, "final answer")}
+      <div class="final-head">
+        <svg class="ic" aria-hidden="true"><use href="#i-check"/></svg><span>Final answer</span>
+        <div class="final-toolbar">
+          <button class="final-toggle" data-mode="rendered">View raw</button>
+          ${copyBtnHtml(0, "final answer")}
+        </div>
       </div>
       <div class="final-rendered">${markdown(content)}</div>
       <pre class="final-raw hidden"></pre>`;
@@ -993,6 +1006,26 @@
       }
     },
     ask_human(ev) { addAskCard(ev.question); },
+    auth_required(ev) {
+      // Authorization handoff (e.g. Google consent): a real card with a real
+      // link - never an agent-taken screenshot of the consent page.
+      if (!ev.url) return;
+      clearWelcome();
+      const el = document.createElement("div");
+      el.className = "auth-card";
+      el.setAttribute("role", "alert");
+      el.innerHTML = `
+        <div class="auth-icon">${icon("i-plug")}</div>
+        <div class="auth-body">
+          <div class="auth-title">Authorization needed${ev.tool ? ` — ${esc(ev.tool)}` : ""}</div>
+          <div class="auth-text">This step needs your sign-in to continue. Complete the consent in the browser, then ask me to retry.</div>
+          <a class="auth-open" href="${esc(ev.url)}" target="_blank" rel="noopener">Open authorization page</a>
+          <div class="auth-note">Also opened automatically in this Mac's default browser.</div>
+        </div>`;
+      messages.appendChild(el);
+      keepPillLast();
+      scrollDown(messages);
+    },
     final_result(ev) {
       if (ev.content) addFinal(ev.content);
       const pill = $("livePill");

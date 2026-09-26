@@ -525,14 +525,49 @@ body {
   margin: 14px 0;
   padding: 14px 16px;
   background: var(--bg);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--green);
   border-radius: var(--radius);
   font-size: 13.5px;
   overflow-wrap: break-word;
 }
+.final-head {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 650;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--green);
+  margin-bottom: 8px;
+}
+.final-head .final-toolbar { margin-left: auto; margin-bottom: 0; }
 .final-toolbar {
   display: flex; align-items: center; justify-content: flex-end; gap: 8px;
   margin-bottom: 6px;
 }
+
+/* Authorization handoff card (Google consent etc.) */
+.auth-card {
+  display: flex; gap: 12px;
+  margin: 14px 0; padding: 14px 16px;
+  border: 1px solid var(--amber);
+  border-left: 3px solid var(--amber);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+.auth-icon { color: var(--amber); flex: none; }
+.auth-icon .ic { width: 20px; height: 20px; }
+.auth-body { flex: 1; min-width: 0; }
+.auth-title { font-weight: 650; font-size: 13.5px; margin-bottom: 4px; }
+.auth-text { font-size: 12.5px; color: var(--text-dim); margin-bottom: 10px; }
+.auth-open {
+  display: inline-block;
+  background: var(--accent); color: #fff;
+  padding: 7px 14px; border-radius: 8px;
+  font-size: 12.5px; font-weight: 600;
+  text-decoration: none;
+}
+.auth-open:hover { filter: brightness(1.12); }
+.auth-open:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.auth-note { font-size: 11px; color: var(--text-faint); margin-top: 8px; }
 .final-toggle {
   border: 1px solid var(--border-strong);
   background: var(--panel);

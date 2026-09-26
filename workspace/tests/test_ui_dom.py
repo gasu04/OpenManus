@@ -407,6 +407,30 @@ def test_model_form_fetch_populates_datalist(page, monkeypatch):
     assert errors[errors_before:] == []
 
 
+def test_auth_card_and_bare_url_linkify(page):
+    """Regression for 'auth URL arrived as a screenshot/unclickable blob':
+    an auth_required event renders a card with a real link, and bare URLs in
+    final answers become anchors."""
+    page, errors = page
+    errors_before = len(errors)
+    page.evaluate(
+        """() => {
+          window.__om.dispatch('auth_required', {url: 'https://accounts.google.com/o/oauth2/auth?x=1', tool: 'mcp_google_list_calendars'});
+          window.__om.dispatch('final_result', {content: 'Consent: https://accounts.google.com/o/oauth2/auth?x=1. Then retry.'});
+        }"""
+    )
+    card = page.locator(".auth-card")
+    expect(card).to_be_visible()
+    expect(card.locator(".auth-title")).to_contain_text("Authorization needed")
+    expect(card.locator("a.auth-open")).to_have_attribute(
+        "href", "https://accounts.google.com/o/oauth2/auth?x=1"
+    )
+    final_link = page.locator(".final .final-rendered a").last
+    expect(final_link).to_have_attribute("href", "https://accounts.google.com/o/oauth2/auth?x=1")
+    expect(page.locator(".final .final-head")).to_contain_text("Final answer")
+    assert errors[errors_before:] == []
+
+
 def test_logout_invalidates_the_session_server_side(page):
     page, _ = page
     old_cookie = next(c for c in page.context.cookies() if c["name"] == "om_session")
