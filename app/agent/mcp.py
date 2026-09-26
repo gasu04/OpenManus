@@ -6,7 +6,7 @@ from app.agent.toolcall import ToolCallAgent
 from app.logger import logger
 from app.prompt.mcp import NEXT_STEP_PROMPT, SYSTEM_PROMPT
 from app.schema import AgentState, Message
-from app.tool.mcp import MCPClients
+from app.tool.mcp import MCPClients, _tool_input_schema
 
 
 class MCPAgent(ToolCallAgent):
@@ -110,7 +110,7 @@ class MCPAgent(ToolCallAgent):
 
         # Get current tool schemas directly from the server
         response = await self.mcp_clients.list_tools()
-        current_tools = {tool.name: tool.inputSchema for tool in response.tools}
+        current_tools = {tool.name: _tool_input_schema(tool) for tool in response.tools}
 
         # Determine added, removed, and changed tools
         current_names = set(current_tools.keys())

@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import AsyncExitStack
 from typing import Dict, List, Optional
 
@@ -23,6 +24,20 @@ def _merged_env(env: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
     if not env:
         return None
     return {**get_default_environment(), **env}
+
+
+def _tool_input_schema(tool: object) -> dict:
+    """Extract a tool's input schema across MCP SDK 1.x/2.x.
+
+    SDK 1.x exposes Tool.inputSchema (camelCase); SDK 2.x renamed the field
+    to input_schema (snake_case). The venv may carry either (scrapling[ai]
+    pulls 2.x while the app was written against 1.x), so probe both.
+    """
+    return (
+        getattr(tool, "input_schema", None)
+        or getattr(tool, "inputSchema", None)
+        or {}
+    )
 
 
 class MCPClientTool(BaseTool):
@@ -157,7 +172,7 @@ class MCPClients(ToolCollection):
             server_tool = MCPClientTool(
                 name=tool_name,
                 description=tool.description,
-                parameters=tool.inputSchema,
+                parameters=_tool_input_schema(tool),
                 session=session,
                 server_id=server_id,
                 original_name=original_name,
@@ -208,6 +223,15 @@ class MCPClients(ToolCollection):
                     if exit_stack:
                         try:
                             await exit_stack.aclose()
+                        except asyncio.CancelledError:
+                            # anyio raises this when the stdio server's own
+                            # task group tears down a still-running subprocess
+                            # (single-task callers hit it in run()'s cleanup).
+                            # It is teardown noise from the child, not a
+                            # request to cancel us - log and keep cleaning up.
+                            logger.warning(
+                                f"Subprocess teardown cancellation during disconnect from {server_id}, continuing with cleanup"
+                            )
                         except RuntimeError as e:
                             if "cancel scope" in str(e).lower():
                                 logger.warning(
