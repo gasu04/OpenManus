@@ -652,3 +652,16 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 **Next session should:**
 - Operator retries a Google task -> completes consent via the new card; verify one live gmail/calendar call, then commit this batch (suggest: fix(web): auth-handoff cards + linkify + final-answer prominence; fix(deps): mcp SDK 1.x/2.x compat shim; feat: firecrawl+scrapling servers).
 - Operator may paste FIRECRAWL_API_KEY / API_TOKEN / SHODAN_API_KEY into mcp.json env blocks to unlock full tiers.
+
+## Session: 2026-09-26 16:30
+**Goal:** Continue pending tasks: verify Google consent flow end-to-end; commit the auth-UX/SDK-shim batch.
+**Completed:**
+- Observed the operator's own live Gmail run (started 16:23): agent connected all 10 enabled servers (incl. google 20 tools, scrapling 13) and is parked at an ask_human question asking for the Google email address. Token file still the dead Sep-10 one — consent not yet re-completed. Did NOT interfere with the live run.
+- Committed the pending batch: afbd740 fix(deps) MCP SDK shim + teardown hardening; 4560526 fix(web) auth cards + linkify + final prominence; 09c6f36 docs journal. Branch now 10 commits ahead of fork.
+**State left in:**
+- Live gmail run waiting for the operator's chat reply (email + what to list). After they answer: gmail tool call -> dead token -> ACTION REQUIRED -> NEW auth card with link + host-browser auto-open (the fixed UX) -> operator consents -> retry succeeds.
+**Files changed:**
+- Committed (see hashes above); openmanus_sessions.md: this entry (uncommitted).
+**Next session should:**
+- Confirm the consent completed (token file mtime bumps) and one gmail/calendar call succeeded; if the consent screen is still in Testing mode, remind the operator to publish it (7-day refresh expiry).
+- Push the 10-commit branch when the operator says the word. brightdata/shodan keys still operator-side.
