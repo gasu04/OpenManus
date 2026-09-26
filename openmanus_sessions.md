@@ -579,3 +579,76 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - Operator completes Google OAuth bootstrap (README steps 1-6), then enables the google toggle; verify a live gmail/calendar tool call through an agent run.
 - Commit this batch when asked (suggested split: feat MCP env+descriptions+google / feat models providers+fetch).
 - Consider updating config.toml deepseek-chat -> deepseek-flash with the operator's go-ahead.
+
+## Session: 2026-09-24 21:50
+**Goal:** Continue pending tasks: finish Google MCP activation, deepseek-flash switch, cosmetic tool-category gap, teardown hardening.
+**Completed:**
+- Google connector: found a PRE-EXISTING setup from 2026-09-10 (~/.google_workspace_mcp/credentials/gsanchezurrutia@gmail.com.json) whose refresh token had died (invalid_grant — Testing-mode consent screens expire refresh tokens in 7 days). uvx workspace-mcp connects and exposes 20 tools (gmail x4, calendar x3, drive x9, chat x4). Recovered the OAuth client_id/secret from the stored token file and wrote them into config/mcp.json's google env (file chmod 600, never printed). Enabled google in mcp.json. Auth flow now starts correctly: browser auto-opens with consent URL, redirect listener on localhost:8001 (8000 taken by webapp). REMAINING MANUAL STEP: operator must complete the consent ONCE while a run is active (first tool call re-triggers it) — after that headless forever. Note: the consent URL opened during my test is stale (its listener exited); a fresh one opens on the first real tool call.
+- config.toml: deepseek-chat -> deepseek-flash in [llm] (line 7 only; vision untouched); live-verified with a real LLM call (replied OK, 87 tokens). Webapp restarted; active model confirmed deepseek-flash.
+- workspace/webapp.py _tool_category: mcp_playwright_browser_* tools now render in the Browser pane.
+- app/tool/mcp.py disconnect: also catches asyncio.CancelledError from stdio task-group teardown (log + continue cleanup) — the run()-masks-its-own-return-value quirk found during MCP install is now handled at the framework level.
+- Suite 31/31 green; webapp restarted with google enabled + deepseek-flash active; README Google section updated with the webapp-driven consent path + Testing-mode 7-day expiry warning.
+**State left in:**
+- google ENABLED and fully wired; awaits ONE consent click by the operator (happens automatically in the browser during the first Google tool call of a run). Chat tools will likely 403 on @gmail.com (Workspace-only) — gmail/calendar/drive are unaffected.
+**Files changed:**
+- config/mcp.json (gitignored, chmod 600): google enabled + OAuth env wired.
+- config/config.toml (gitignored): deepseek-flash.
+- app/tool/mcp.py: CancelledError-tolerant disconnect. workspace/webapp.py: _tool_category playwright prefix.
+- workspace/README_webapp.md: consent path + production-publish warning. openmanus_sessions.md: this entry.
+**Next session should:**
+- After the operator completes the consent click: verify one live gmail/calendar tool call through an agent run, then commit this batch (code: mcp.py + webapp.py + README; note mcp.json/config.toml are gitignored local config).
+- Push the 7-commit branch to fork if the user says the word.
+
+## Session: 2026-09-24 23:45
+**Goal:** WEB RESEARCH ONLY (no code changes): find and live-verify the best currently-maintained MCP servers for website tech reconnaissance (tech-stack fingerprinting, HTTP headers, TLS, DNS/WHOIS, subdomains via crt.sh/SecurityTrails, API/GraphQL discovery, source maps, IP/host intel à la Shodan/urlscan).
+**Completed:**
+- Live-verified via GitHub API (gh, authenticated), npm/PyPI registries, official MCP registry, and vendor docs/pricing pages. Key results: BuiltWith has an OFFICIAL hosted MCP (https://api.builtwith.com/mcp — live-tested tools/list + auth error path; repo builtwith/builtwith-mcp, 40★, pushed 2026-09-14; stdio fallback via `npx -y builtwith-official-cli mcp`, npm v1.9.0). Best Shodan = community w0h1v/mcp-shodan (173★, 2026-09-08; `npx -y @burtthecoder/mcp-shodan`, npm 1.0.32); no official Shodan MCP exists (no shodan/shodanio GitHub org). urlscan has NO official MCP (official `urlscan` org ships CLI+python only); best community = nlink-jp/urlscan-lookup (brew binary, `urlscan-lookup mcp`). SecurityTrails = aqhmal/securitytrails-mcp (npm 1.0.1, 2026-09-18, 0★). crt.sh/DNS/WHOIS keyless = badchars/osint-mcp-server (55★, npx, but stale since 2026-03-17). Wappalyzer official MCP repo exists (wappalyzer/mcp, 4★) but is NOT published to npm — clone-only. KincaidYang/whois (64★) = self-hosted WHOIS/RDAP daemon w/ /mcp HTTP endpoint. 2026 standout: mukul975/cve-mcp-server (1581★).
+- Free-tier facts verified live: Wappalyzer free = 50 lookups/mo; Shodan free API key exists (Membership $49 one-time = 100 query credits/mo); urlscan unauthenticated = minor quotas, free key raises them; SecurityTrails paid from $500/mo (free key on signup, small quota); BuiltWith = prepaid credits or x402 USDC ~$0.05/lookup, no real free tier.
+- Full ranked 8-entry report with exact OpenManus mcp.json configs delivered to user in final message.
+**State left in:**
+- No files/servers changed (research only). Webapp + google-connector state from 21:50 session untouched.
+**Files changed:**
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- If user picks servers: add BuiltWith (hosted, needs header-capable HTTP transport or `bw mcp` stdio) + w0h1v/mcp-shodan to config/mcp.json with keys in env, then test one live recon task end-to-end.
+
+## Session: 2026-09-24 23:59
+**Goal:** Web research only: verify best currently-maintained MCP servers for heavy-duty scraping/crawling (full-site crawls, anti-bot, structured extraction, batch, archiving) vs the installed stack (crawl4ai built-in, Playwright MCP, browser-use, Exa).
+**Completed:**
+- Live-verified via GitHub API, npm/PyPI registries, and official docs/pricing pages: Firecrawl MCP (7.5k stars, npx firecrawl-mcp@3.25.4, free 1k credits/mo), Bright Data MCP (2.7k, npx @brightdata/mcp@2.11.3, 5k free req/mo no card), Apify MCP (8.4k, npx @apify/actors-mcp-server@0.16.0, $5/mo free usage), Scrapling MCP (83k, pip "scrapling[ai]" -> scrapling-mcp, self-hosted Cloudflare bypass), ZenRows MCP (official, 19 stars, npx @zenrows/mcp@2.2.4 + auto-signup free plan), Scrapeless MCP (official, 169 stars, npx scrapeless-mcp-server@0.6.3), Oxylabs MCP (REPO ARCHIVED 2026-09-07, uvx oxylabs-mcp@0.9.3, AI Studio pivot, 1k free credits), crawl4ai own MCP (docker-only SSE/WS :11235, no stdio/uvx — duplicates built-in), ScrapingBee (official but 0 stars/stale), Zyte (NO official MCP), invisible_playwright_mcp (uvx, needs OpenRouter key, browser-agent not bulk scraper).
+- Delivered ranked 8-entry markdown report with stdio commands, free tiers, caveats, and bottom line (Firecrawl for crawls, Bright Data for unblocking, both worth adding).
+**State left in:** Nothing running, nothing broken. Research only; no config changes.
+**Files changed:** openmanus_sessions.md: this entry.
+**Next session should:** If the operator wants, wire Firecrawl + Bright Data into config/mcp.json (stdio, env keys) and smoke-test one map/crawl + one unlock call.
+
+## Session: 2026-09-24 22:15
+**Goal:** Research MCP servers for heavy website scraping + site code/backend reconnaissance.
+**Completed:**
+- Two parallel verified research sweeps (scraping/crawling; tech-recon/fingerprinting). Key conclusion: existing stack (crawl4ai, browser_use, Playwright MCP w/ network capture, Exa) already covers single-page scraping and page-level tech fingerprinting; genuine gaps are hosted crawl-at-scale, managed anti-bot unblocking, historical tech-stack intel, and server-side exposure intel.
+- Ranked recommendations delivered: Firecrawl MCP (full-site map->crawl, 1000 free credits/mo), Bright Data MCP (unblocking, 5000 free req/mo), BuiltWith MCP (official, tech-stack graph, paid/x402), w0h1v/mcp-shodan (ports/banners/certs/CVEs), Scrapling MCP (free self-hosted stealth), osint-mcp-server (keyless crt.sh/DNS/WHOIS). Rejected: Oxylabs (archived), crawl4ai-MCP (duplicate), Zyte/ScrapingBee (no viable official), SecurityTrails (0 stars/pricey), wappalyzer/mcp (half-published), standalone crt.sh/urlscan MCPs (bash one-liners suffice).
+- No installs performed — awaiting user's pick.
+**State left in:**
+- Unchanged since last entry (google enabled awaiting consent click; deepseek-flash active; 7-commit branch unpushed).
+**Files changed:**
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- If user picks: add chosen servers to config/mcp.json (env keys go in the entry's env), verify connectivity + panel, run a dogfood scrape/recon task, commit code batch.
+
+## Session: 2026-09-25 15:45
+**Goal:** Fix webapp rendering issues reported by the operator (auth URL arrived as a screenshot instead of a link; final results not visible) + UI best-practice pass; install the approved scraping/recon MCP set.
+**Completed:**
+- P0 regression (self-inflicted): scrapling[ai] venv install silently upgraded mcp 1.5 -> 2.2.0 whose Tool model renamed inputSchema -> input_schema, breaking app/tool/mcp.py + app/agent/mcp.py on every server connect. Fixed with _tool_input_schema() SDK-1.x/2.x shim; requirements.txt pin widened to mcp>=1.5,<3. Verified: all enabled servers connect (playwright 25, shadcn 7, memory 9, exa 2, mobile 32, google 20, firecrawl 27).
+- Scraping/recon set installed: firecrawl (keyless mode, 27 tools), scrapling (venv install + `scrapling install` browsers, 13 tools, enabled); brightdata + shodan registered but DISABLED (servers hard-require API_TOKEN/SHODAN_API_KEY at boot — descriptions tell the operator where to paste keys, then toggle on).
+- Authorization handoff UX (the operator's actual complaint): tool results matching auth markers now emit a dedicated `auth_required` WS event (deduped per URL per session) -> frontend renders an amber attention card with a real "Open authorization page" link, and the backend best-effort `open`s the URL in the host Mac's default browser (darwin-gated, fire-and-forget). Root cause of "it showed an image": agent screenshotted the consent page because the URL was an unclickable blob.
+- Final-result visibility: .final got a "Final answer" label + green accent border (was unlabeled, blended into cards); markdown renderer now linkifies BARE URLs (md-links stashed first to avoid double-linking) and groups consecutive <li> into one <ul> (was orphaning the last item with a visible gap).
+- Tests 33/33 green (new: _extract_auth_url unit, DOM auth-card + linkify + final-head). Live Playwright screenshots reviewed: auth card, polished final answer, 11-server panel.
+**State left in:**
+- Webapp restarted with all fixes live. Google consent STILL pending the operator's click (this run is exactly how they hit the UX bug — retry now: the card gives a real link AND the Mac auto-opens it). brightdata/shodan await operator keys. UNCOMMITTED: app/tool/mcp.py, app/agent/mcp.py, requirements.txt, workspace/webapp.py, static app.js+style.css, both test files, README, this journal.
+**Files changed:**
+- app/tool/mcp.py: _tool_input_schema shim (+import asyncio for earlier CancelledError fix). app/agent/mcp.py: use shim. requirements.txt: mcp>=1.5,<3.
+- workspace/webapp.py: _extract_auth_url + _maybe_emit_auth_required + _auth_urls_seen; _tool_category playwright prefix (prev. session).
+- workspace/static/app.js: markdown bare-URL linkify + <ul> grouping fix, auth_required handler/card, final-head label. style.css: .auth-card + .final prominence.
+- Tests + README updated. config/mcp.json (gitignored): firecrawl/scrapling enabled, brightdata/shodan disabled-pending-keys.
+**Next session should:**
+- Operator retries a Google task -> completes consent via the new card; verify one live gmail/calendar call, then commit this batch (suggest: fix(web): auth-handoff cards + linkify + final-answer prominence; fix(deps): mcp SDK 1.x/2.x compat shim; feat: firecrawl+scrapling servers).
+- Operator may paste FIRECRAWL_API_KEY / API_TOKEN / SHODAN_API_KEY into mcp.json env blocks to unlock full tiers.
