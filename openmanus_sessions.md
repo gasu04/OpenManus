@@ -665,3 +665,41 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 **Next session should:**
 - Confirm the consent completed (token file mtime bumps) and one gmail/calendar call succeeded; if the consent screen is still in Testing mode, remind the operator to publish it (7-day refresh expiry).
 - Push the 10-commit branch when the operator says the word. brightdata/shodan keys still operator-side.
+
+## Session: 2026-09-26 17:20
+**Goal:** Configure the operator-supplied Bright Data API token and bring the server live.
+**Completed:**
+- Wrote API_TOKEN into config/mcp.json's brightdata env (file already 600/gitignored; value never echoed). Enabled the entry.
+- Verified end-to-end: server auto-provisioned its mcp_unlocker + mcp_browser zones on the account, 5 core tools exposed (search_engine(+batch), scrape_as_markdown, scrape_batch, discover), and a live scrape_as_markdown(example.com) call succeeded (~3s) — key valid on the free tier.
+- Applied to production WITHOUT a restart (the operator's gmail run is still parked at ask_human): POST /api/mcp/servers/brightdata/toggle hot-connected it on the live session's agent (applied=1); panel shows enabled, 1 session, 5 tools.
+**State left in:**
+- 10 of 11 servers enabled; only shodan awaits its key. Gmail run still awaiting the operator's chat reply + consent. Branch 11 commits on fork (all pushed); this journal entry uncommitted.
+**Files changed:**
+- config/mcp.json (gitignored): brightdata env + enabled.
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Verify the google consent completed (token mtime bump) + one successful gmail/calendar call; then commit the journal.
+
+## Session: 2026-09-26 17:25
+**Goal:** Configure the operator-supplied Shodan API key and bring the server live.
+**Completed:**
+- Wrote SHODAN_API_KEY into config/mcp.json's shodan env (no echo), enabled. Verified: 7 tools (ip_lookup, shodan_search, dns_lookup, reverse_dns_lookup, cve_lookup, cpe_lookup, cves_by_product); live cve_lookup(CVE-2021-44228) returned the full Log4Shell record — key valid. (Note for future tool calls: the CVE tools take param `cve`, not `cve_id`.)
+- Hot-applied to production via the toggle API (applied=1 on the live session — still no restart, the parked gmail run is undisturbed). ALL 11 SERVERS NOW ENABLED.
+**State left in:**
+- Full stack live: browser_use, playwright, shadcn, memory, exa, mobile, google, firecrawl, brightdata, shodan, scrapling. Gmail run still parked awaiting the operator's chat reply + Google consent.
+**Files changed:**
+- config/mcp.json (gitignored): shodan env + enabled.
+- openmanus_sessions.md: this entry (uncommitted).
+**Next session should:**
+- Verify google consent completed + one successful google tool call; commit the journal.
+
+## Session: 2026-09-26 17:40
+**Goal:** Close out the Google connector verification.
+**Completed:**
+- Operator completed the consent (16:38): credentials file rewritten with a fresh token, oauth_states.json consumed. Their live gmail run then succeeded end-to-end: authenticated as gsanchezurrutia@gmail.com, read and summarized 15 inbox messages (PRISMA event details, two ticket orders). The full auth-UX chain worked as designed: ask_human reply -> tool call -> dead token -> auth card + host-browser open -> consent -> retry -> success.
+**State left in:**
+- ALL 11 MCP servers enabled and proven except mobile (no devices attached) and brightdata's paid zones. Google connector headless from here on (token refreshes from disk). Reminder outstanding: publish the Google consent screen to "In production" or the refresh token dies again in ~7 days.
+**Files changed:**
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Nothing scheduled. Commit this journal on the next commit request; push with it.
