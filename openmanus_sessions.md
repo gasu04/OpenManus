@@ -703,3 +703,51 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - openmanus_sessions.md: this entry.
 **Next session should:**
 - Nothing scheduled. Commit this journal on the next commit request; push with it.
+
+## Session: 2026-09-26 18:00
+**Goal:** Write a detailed capability spec of the current OpenManus install (operator-requested document).
+**Completed:**
+- Inventoried the live system (19 branch commits vs upstream, 33 tests collected, 10 mcp.json entries + browser_use built-in, browser_use exposes 2 tools -> 153 tools/session total) and wrote openmanus_capability_spec.md at repo root: architecture, web console (UI/security/models/MCP panel), agent core, per-server stack table, capability matrix, config/data files, quality/ops, known limits.
+- Note: the operator pasted a stale todo list from the Google-connectors session as "pending" — confirmed all those items were already shipped (commit 74c2ebf et al.) before proceeding.
+**State left in:**
+- Spec doc written (untracked, like the other operator research docs). All systems live; nothing else pending except the operator-side items listed in the spec's §8 (consent-screen publish chief among them).
+**Files changed:**
+- openmanus_capability_spec.md: NEW — full installation capability spec.
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Offer to commit the spec (or leave untracked per the other research docs' pattern) at the next commit request.
+
+## Session: 2026-09-26 18:10
+**Goal:** Move openmanus_capability_spec.md to iCloud Drive's Obsidian folder.
+**Completed:**
+- Resolved "Obsidian folder" to the actual Obsidian vault root (~/Library/Mobile Documents/iCloud~md~obsidian/Documents/ — has .obsidian config; no CloudDocs/Obsidian folder exists). Moved the spec there and verified both ends (present in vault, absent from repo).
+**State left in:**
+- Spec now lives in the Obsidian vault (syncs via iCloud to all devices). Repo has no copy.
+**Files changed:**
+- openmanus_capability_spec.md: MOVED out of repo -> Obsidian vault root.
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Nothing pending.
+
+## Session: 2026-09-27 00:30
+**Goal:** TASK: install/configure/verify 9 new MCP servers + mitmproxy workflow + agent tuning (deep-research + reverse-engineering stack), phased with hard constraints.
+**Completed (by phase):**
+- P0: backup (config/mcp.json.bak-20260926-1910, 600; added mcp.json.bak-* to config/.gitignore — was committing-risk), baseline 11 servers, suite 33/33, prereqs uv/uvx/npx/gh OK (docker daemon DOWN -> GitHub MCP via official binary instead).
+- P1.1 Serena: uv tool install, verified (activate_project needs session_id in serena 2.0; symbols overview on recon/fastapi returned APIRouter/APIRoute via LSP); context renamed ide-assistant->claude-code; toggled OFF after verify.
+- P1.2 GitHub MCP: official binary v1.12.2 at ~/openmanus-bin/ghmcp/ (docker daemon down); token from gh keyring (gasu04); 45 tools; search_code "AeroDR" PASS (structured results). ON.
+- P1.3 Context7: 2 tools; next.js routing docs 2968 chars. ON.
+- P1.4 Semgrep (v1.178.0): 7 tools; real CLI scan on recon/fastapi files -> clean findings JSON. Per budget policy toggled OFF (per-task).
+- P2.1 arXiv (pinned ==0.7.2; unpinned resolves a DIFFERENT package providing arxiv-search): 19 tools. PARTIAL: export.arxiv.org search API 406s this host's python clients (identical URLs return 200 via curl; UA ruled out) — download/read-by-ID works (13k chars read). ON with description noting the ID-based flow.
+- P2.2 Tavily (key from operator): 5 tools; search 18k chars + extract PASS. ON.
+- P2.3 fetch: PASS (example.com -> markdown). youtube: DEFERRED (YouTube "video unavailable" across videos from this IP; server connects with 2 tools; yt-dlp/bash is the fallback). OFF.
+- P3.1 E2B (key from operator): @e2b/mcp-server 0.2.3, run_code PASS (stdout returned; lifecycle server-managed). CLAUDE.md gained the untrusted-code=E2B-only policy (§2.7). ON.
+- P3.2 Figma: DEFERRED (no desktop/Dev seat per operator).
+- P3.3 mitmproxy 12.2.3 installed (brew cask); workspace/playbooks/api-reversing.md written (capture options, HAR export, agent analysis prompt, secrets handling, pinning limits).
+- P4: WEBAPP_MAX_STEPS=50 appended to ~/openmanus-bin/webapp.env (600) + one justified restart; verified in live process env. Semgrep toggled off per budget. Suite re-run: 34/34 (added test: unknown-server toggle reloads registry without restart — webapp.py toggle endpoint now refreshes the registry before 404ing; live process picked it up via the restart).
+- Constraint checks: mcp.json 600 after every edit; no secrets echoed (gh token masked ...W6hh); per-server isolation intact (brightdata/shodan boot-failures earlier never blocked sessions; per-server try/except in initialize_mcp_servers).
+**State left in:**
+- 20 servers registered, 17 enabled, 3 disabled (serena, semgrep per-task; youtube deferred). backup at config/mcp.json.bak-20260926-1910. recon clone at workspace/recon/fastapi (gitignored by workspace/* rule). UNCOMMITTED: webapp.py (toggle reload fix), CLAUDE.md (E2B policy), config/.gitignore (bak rule), tests (+1), journal.
+**Files changed:**
+- config/mcp.json (gitignored, 600): +9 entries (serena, github, context7, semgrep, arxiv, fetch, youtube, tavily, e2b). workspace/webapp.py: toggle reload-on-unknown. CLAUDE.md: §2.7 E2B policy. config/.gitignore: bak rule. workspace/tests/test_webapp_smoke.py: +1 test. workspace/playbooks/api-reversing.md: NEW. ~/openmanus-bin/webapp.env: WEBAPP_MAX_STEPS=50. openmanus_sessions.md: this entry.
+**Next session should:**
+- Commit the code batch (fix(web) toggle reload + docs/CLAUDE.md policy + tests + gitignore). Update the Obsidian capability spec (17 servers, ~340 tools, deep-research/recon stack, max_steps 50). arXiv search: retry from another network or later date; youtube transcripts: revisit or use yt-dlp fallback.
