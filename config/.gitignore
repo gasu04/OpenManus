@@ -2,3 +2,4 @@
 config.toml
 # local MCP server registry (may hold machine-specific commands/keys)
 mcp.json
+mcp.json.bak-*

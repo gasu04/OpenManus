@@ -14,6 +14,8 @@ workspace/*
 !workspace/static/**
 !workspace/tests/
 !workspace/tests/**
+!workspace/playbooks/
+!workspace/playbooks/**
 
 ### Python ###
 # Byte-compiled / optimized / DLL files

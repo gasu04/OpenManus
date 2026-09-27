@@ -241,6 +241,10 @@ tests/
 - **Pinned versions** in production (`requirements.lock` from `pip freeze`).
 - **Non-root users** in containers.
 - **No sensitive data** in URL parameters, query strings, or filenames.
+- **Untrusted code execution:** all cloned, downloaded, or third-party code
+  executes in E2B sandboxes only (via the `e2b` MCP server). Host
+  `python_execute` is for trusted workspace scripts only — never for
+  cloned/untrusted code.
 
 ### 2.8 Code Organization \[MANDATORY\]
 
