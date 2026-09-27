@@ -24,6 +24,7 @@ import importlib.util
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import urllib.request
@@ -33,6 +34,9 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("WEBAPP_AUTH_PASS", "testpass")
+# Keep test runs' task journals/exports out of the operator's real vault.
+os.environ.setdefault("WEBAPP_OBSIDIAN_TASKS_DIR", tempfile.mkdtemp(prefix="om-test-vault-"))
+os.environ.setdefault("WEBAPP_OUTPUT_EXPORT_DIR", tempfile.mkdtemp(prefix="om-test-export-"))
 
 _spec = importlib.util.spec_from_file_location("webapp_dom_under_test", PROJECT_ROOT / "workspace" / "webapp.py")
 webapp = importlib.util.module_from_spec(_spec)
@@ -428,6 +432,51 @@ def test_auth_card_and_bare_url_linkify(page):
     final_link = page.locator(".final .final-rendered a").last
     expect(final_link).to_have_attribute("href", "https://accounts.google.com/o/oauth2/auth?x=1")
     expect(page.locator(".final .final-head")).to_contain_text("Final answer")
+    assert errors[errors_before:] == []
+
+
+def test_new_task_clears_all_panes(page):
+    """'New' must clear the previous task's artifacts from EVERY pane."""
+    page, errors = page
+    errors_before = len(errors)
+    page.evaluate(
+        """() => {
+          const om = window.__om;
+          om.dispatch('final_result', {content: 'old task result'});
+          om.dispatch('terminal', {code: 'print(1)', output: '1'});
+          document.querySelector('#editorSidebar').innerHTML = '<div class="file-group-label">stale-tree</div>';
+          document.querySelector('#filesList').innerHTML = '<div>stale-file</div>';
+          document.querySelector('#tokenStat').textContent = '9,999 in / 9,999 out';
+          document.querySelector('#liveLabel').textContent = 'Done';
+          document.querySelector('#promptInput').value = 'stale draft';
+        }"""
+    )
+    page.click("#btnNew")
+    expect(page.locator("#welcome")).to_be_visible()
+    expect(page.locator("#timeline .pane-empty")).to_have_count(1)
+    expect(page.locator("#terminal .pane-empty")).to_have_count(1)
+    expect(page.locator("#editorSidebar")).to_be_empty()
+    expect(page.locator("#filesList .pane-empty")).to_have_count(1)
+    expect(page.locator("#tokenStat")).to_have_text("0 in / 0 out")
+    expect(page.locator("#liveLabel")).to_have_text("Idle")
+    expect(page.locator("#promptInput")).to_have_value("")
+    assert errors[errors_before:] == []
+
+
+def test_upload_chips_flow(page, tmp_path, monkeypatch):
+    page, errors = page
+    errors_before = len(errors)
+    monkeypatch.setattr(webapp, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(webapp, "UPLOAD_DIR", tmp_path / "uploads")
+    f = tmp_path / "notes.txt"
+    f.write_text("hello agent")
+    page.set_input_files("#fileInput", str(f))
+    chip = page.locator(".upload-chip")
+    expect(chip).to_have_count(1, timeout=5000)
+    expect(chip.locator(".upload-chip-name")).to_have_text("notes.txt")
+    assert (tmp_path / "uploads" / "notes.txt").read_text() == "hello agent"
+    chip.locator(".upload-chip-x").click()
+    expect(page.locator(".upload-chip")).to_have_count(0)
     assert errors[errors_before:] == []
 
 

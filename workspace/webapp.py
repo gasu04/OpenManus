@@ -53,6 +53,7 @@ import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sys
 import time
 import traceback
@@ -92,6 +93,84 @@ MAX_FILE_BYTES = 1_000_000       # refuse to serve files larger than this
 MAX_EVENT_LOG = 2000             # per-session replay buffer
 HUMAN_REPLY_TIMEOUT = 600        # seconds to wait for ask_human answer
 SNAPSHOT_BYTES = 200_000         # max file content pushed in file_update events
+
+
+def _safe_filename(name: str) -> str:
+    """Strip any directory components and unsafe chars from an upload name."""
+    base = Path(name or "file").name  # kills ../, absolute paths, drive letters
+    base = _SAFE_NAME_RE.sub("_", base).strip("._")
+    return base or "file"
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Lowercase dash slug for journal/export folder names."""
+    slug = _SAFE_NAME_RE.sub("-", (text or "").strip().lower()).strip("-")
+    return (slug or "task")[:max_len].rstrip("-")
+
+
+def _write_task_journal(
+    session: "AgentSession", status: str, final: str = "", new_files: tuple = ()
+) -> None:
+    """Write the session's .md journal into the Obsidian vault (one file per
+    task: description up front, output + produced-files appended at run end).
+
+    Failures here must never affect the run (§resilience: log and move on).
+    """
+    try:
+        OBSIDIAN_TASKS_DIR.mkdir(parents=True, exist_ok=True)
+        path = session.journal_path()
+        lines = [
+            "---",
+            f'title: "{(session.title or "task").replace(chr(34), chr(39))}"',
+            f"date: {time.strftime('%Y-%m-%d %H:%M', time.localtime(session.created_at or time.time()))}",
+            f"session: {session._journal_suffix}",
+            f"status: {status}",
+            "---",
+            "",
+            f"# {session.title or 'Task'}",
+            "",
+            "## Task",
+            "",
+            session._first_prompt or session.title or "",
+            "",
+        ]
+        if final:
+            lines += ["## Output", "", final, ""]
+        if new_files:
+            lines += (
+                ["## Files produced", ""]
+                + [f"- `{rel}` (exported to `openmanus_output/{path.stem}/`)" for rel in sorted(new_files)]
+                + [""]
+            )
+        path.write_text("\n".join(lines), encoding="utf-8")
+        logger.info(f"task journal written: {path.name} (status {status})")
+    except Exception as e:
+        logger.warning(f"task journal write failed: {type(e).__name__}")
+
+
+def _export_task_outputs(session: "AgentSession", new_files: tuple) -> list:
+    """Copy files the agent produced this run into iCloud Drive.
+
+    Returns the list of workspace-relative paths actually copied.
+    """
+    copied = []
+    if not new_files:
+        return copied
+    try:
+        dest_dir = OUTPUT_EXPORT_DIR / session.journal_path().stem
+        for rel in sorted(new_files):
+            src = (WORKSPACE_ROOT / rel).resolve()
+            if not src.is_file() or not src.is_relative_to(WORKSPACE_ROOT):
+                continue
+            dest = dest_dir / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dest)
+            copied.append(rel)
+        if copied:
+            logger.info(f"exported {len(copied)} output file(s) to {dest_dir}")
+    except Exception as e:
+        logger.warning(f"output export failed: {type(e).__name__}")
+    return copied
 
 # Origin allowlist: used for CSRF defense on state-changing HTTP routes and
 # for the WebSocket handshake. This app is same-origin only (frontend and
@@ -165,6 +244,28 @@ if "WEBAPP_AUTH_PASS" not in os.environ:
     )
 
 WORKSPACE_ROOT = config.workspace_root.resolve()
+
+# --- Uploads + task output archiving -------------------------------------
+# Uploads land in the workspace so agents can read them with their normal
+# file tools. Task journals (.md per session) go to the operator's Obsidian
+# vault; files the agent produces are exported to iCloud Drive. All paths
+# env-overridable (§2.1) - the defaults are this operator's layout.
+UPLOAD_DIR = WORKSPACE_ROOT / "uploads"
+MAX_UPLOAD_BYTES = int(os.environ.get("WEBAPP_MAX_UPLOAD_MB", "50")) * 1024 * 1024
+OBSIDIAN_TASKS_DIR = Path(
+    os.environ.get(
+        "WEBAPP_OBSIDIAN_TASKS_DIR",
+        "~/Library/Mobile Documents/iCloud~md~obsidian/Documents/openmanus",
+    )
+).expanduser()
+OUTPUT_EXPORT_DIR = Path(
+    os.environ.get(
+        "WEBAPP_OUTPUT_EXPORT_DIR",
+        "~/Library/Mobile Documents/com~apple~CloudDocs/openmanus_output",
+    )
+).expanduser()
+
+_SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 # Secrets at rest should not be world/group-readable. Best-effort: a
 # read-only filesystem or a file that doesn't exist yet must not crash boot.
@@ -590,6 +691,44 @@ def _safe_workspace_path(raw: str) -> Optional[Path]:
     if not resolved.is_file():
         return None
     return resolved
+
+
+@app.post("/api/upload")
+async def upload_files(request: Request, username: str = Depends(require_auth)) -> JSONResponse:
+    """Save uploaded files into workspace/uploads so agents can read them.
+
+    Filenames are sanitized (no traversal), size is capped per file, and an
+    existing name is never silently overwritten (timestamp prefix instead).
+    """
+    form = await request.form()
+    incoming = [v for v in form.values() if hasattr(v, "filename")]
+    if not incoming:
+        raise HTTPException(status_code=400, detail="No files in request")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved = []
+    for item in incoming:
+        name = _safe_filename(getattr(item, "filename", "") or "file")
+        dest = UPLOAD_DIR / name
+        if dest.exists():
+            dest = UPLOAD_DIR / f"{int(time.time())}-{name}"
+        written = 0
+        try:
+            with dest.open("wb") as out:
+                while chunk := await item.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > MAX_UPLOAD_BYTES:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=f"{name} exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB limit",
+                        )
+                    out.write(chunk)
+        except Exception:
+            dest.unlink(missing_ok=True)
+            raise
+        rel = dest.relative_to(WORKSPACE_ROOT).as_posix()
+        saved.append({"name": dest.name, "path": rel, "size": written})
+        logger.info(f"upload by {username}: {rel} ({written} bytes)")
+    return JSONResponse({"files": saved})
 
 
 @app.get("/api/files")
@@ -1567,6 +1706,19 @@ class AgentSession:
         self.created_at: int = 0
         self.last_active: int = 0
         self._auth_urls_seen: set = set()  # auth_required cards already shown (dedupe)
+        self._journal_suffix: str = secrets.token_hex(3)  # unique per task journal/export
+        self._first_prompt: str = ""     # full first prompt (journal body)
+        self._journal_path_cached: Optional[Path] = None
+        self._run_files_start: set = set()  # touched_files snapshot at run start
+
+    def journal_path(self) -> Path:
+        """Stable per-task .md path in the Obsidian vault (computed once)."""
+        if self._journal_path_cached is None:
+            date = time.strftime("%Y-%m-%d", time.localtime(self.created_at or time.time()))
+            self._journal_path_cached = (
+                OBSIDIAN_TASKS_DIR / f"{date}-{_slugify(self.title)}-{self._journal_suffix}.md"
+            )
+        return self._journal_path_cached
 
     # -- websocket plumbing -------------------------------------------------
     async def connect(self, websocket: WebSocket) -> None:
@@ -1815,6 +1967,11 @@ class AgentSession:
         if not self.created_at:
             self.created_at = now
             self.title = prompt.strip().split("\n")[0][:80]
+        if not self._first_prompt:
+            self._first_prompt = prompt.strip()
+        self._run_files_start = set(self.touched_files)
+        run_status, run_final = "running", ""
+        _write_task_journal(self, run_status)
         try:
             agent = await self._ensure_agent()
             await self.send_event("run_start", {"prompt": prompt, "max_steps": agent.max_steps})
@@ -1827,10 +1984,13 @@ class AgentSession:
                 ),
                 "",
             )
+            run_status, run_final = "completed", final
             await self.send_event("final_result", {"content": final})
         except asyncio.CancelledError:
+            run_status = "stopped"
             await self.send_event("status", {"status": "stopped", "message": "Stopped by user"})
         except Exception as exc:
+            run_status = "failed"
             logger.error(f"Agent run failed: {type(exc).__name__}")
             logger.error(traceback.format_exc())
             await self.send_event(
@@ -1841,6 +2001,13 @@ class AgentSession:
                 self._human_future.set_result("(interrupted)")
             self.is_running = False
             self.last_active = int(time.time())
+            new_files = tuple(
+                rel
+                for rel in (self.touched_files - self._run_files_start)
+                if not rel.startswith("uploads/")
+            )
+            copied = _export_task_outputs(self, new_files)
+            _write_task_journal(self, run_status, run_final, tuple(copied))
             await self.send_event("run_end", {})
 
     async def stop(self) -> None:

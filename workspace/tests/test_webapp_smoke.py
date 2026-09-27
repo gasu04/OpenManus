@@ -18,6 +18,7 @@ import importlib.util
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -31,6 +32,9 @@ import pytest
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 os.environ.setdefault("WEBAPP_AUTH_PASS", "testpass")
 os.environ.setdefault("WEBAPP_PORT", "0")
+# Keep test runs' task journals/exports out of the operator's real vault.
+os.environ.setdefault("WEBAPP_OBSIDIAN_TASKS_DIR", tempfile.mkdtemp(prefix="om-test-vault-"))
+os.environ.setdefault("WEBAPP_OUTPUT_EXPORT_DIR", tempfile.mkdtemp(prefix="om-test-export-"))
 
 _spec = importlib.util.spec_from_file_location("webapp_under_test", PROJECT_ROOT / "workspace" / "webapp.py")
 webapp = importlib.util.module_from_spec(_spec)
@@ -477,6 +481,93 @@ def test_models_available_endpoint(server, monkeypatch):
     # provider error maps to 502 without leaking internals
     status, body = http("POST", "/api/models/available", {"base_url": "https://fail.example.com"}, port=port)
     assert status == 502 and "401" in body["detail"]
+
+
+def _multipart(field, filename, content, ctype="text/plain"):
+    boundary = "----omtestboundary"
+    body = (
+        f"--{boundary}\r\n"
+        f'Content-Disposition: form-data; name="{field}"; filename="{filename}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n"
+    ).encode() + content + f"\r\n--{boundary}--\r\n".encode()
+    return body, boundary
+
+
+def test_upload_endpoint(server, tmp_path, monkeypatch):
+    port = server
+    # Both must move together: the endpoint reports paths relative to WORKSPACE_ROOT.
+    monkeypatch.setattr(webapp, "WORKSPACE_ROOT", tmp_path)
+    monkeypatch.setattr(webapp, "UPLOAD_DIR", tmp_path / "uploads")
+
+    def post(body, boundary, auth=AUTH):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/upload",
+            method="POST",
+            data=body,
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                **({"Authorization": "Basic " + _b64(auth)} if auth else {}),
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return res.status, json.loads(res.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    body, boundary = _multipart("files", "../../etc/evil.txt", b"attack")
+    status, _ = post(body, boundary, auth=None)
+    assert status == 401  # auth enforced
+
+    status, data = post(body, boundary)
+    assert status == 200
+    # traversal stripped: lands as a bare sanitized name inside the upload dir
+    assert data["files"][0]["name"] == "evil.txt"
+    assert (tmp_path / "uploads" / "evil.txt").read_bytes() == b"attack"
+
+    # same name again -> not overwritten, timestamp-prefixed copy
+    body, boundary = _multipart("files", "evil.txt", b"second")
+    status, data = post(body, boundary)
+    assert status == 200
+    assert data["files"][0]["name"].endswith("-evil.txt")
+    assert (tmp_path / "uploads" / "evil.txt").read_bytes() == b"attack"
+
+
+def test_task_journal_and_export(tmp_path, monkeypatch):
+    obs, icloud, ws = tmp_path / "vault", tmp_path / "icloud", tmp_path / "ws"
+    obs.mkdir(), icloud.mkdir()
+    (ws / "reports").mkdir(parents=True)
+    (ws / "reports" / "summary.md").write_text("# Summary")
+    monkeypatch.setattr(webapp, "OBSIDIAN_TASKS_DIR", obs)
+    monkeypatch.setattr(webapp, "OUTPUT_EXPORT_DIR", icloud)
+    monkeypatch.setattr(webapp, "WORKSPACE_ROOT", ws)
+
+    session = webapp.AgentSession()
+    session.created_at = 1_700_000_000
+    session.title = "Research AeroDR"
+    session._first_prompt = "Research AeroDR API surface"
+    session.touched_files = {"reports/summary.md"}
+
+    webapp._write_task_journal(session, "running")
+    journal = session.journal_path()
+    assert journal.parent == obs
+    text = journal.read_text()
+    assert "status: running" in text and "Research AeroDR API surface" in text
+
+    copied = webapp._export_task_outputs(session, ("reports/summary.md",))
+    assert copied == ["reports/summary.md"]
+    exported = icloud / journal.stem / "reports" / "summary.md"
+    assert exported.read_text() == "# Summary"
+
+    webapp._write_task_journal(session, "completed", "Done: 3 endpoints found.", tuple(copied))
+    text = journal.read_text()
+    assert "status: completed" in text
+    assert "## Output" in text and "3 endpoints found" in text
+    assert "## Files produced" in text and "reports/summary.md" in text
+
+    # traversal attempts in touched_files never escape the workspace
+    session.touched_files = {"../../etc/passwd"}
+    assert webapp._export_task_outputs(session, ("../../etc/passwd",)) == []
 
 
 def test_extract_auth_url():

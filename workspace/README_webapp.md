@@ -41,6 +41,19 @@ real time.
 - **Visible final answers** — the run's result renders as a labeled,
   accent-bordered "Final answer" block (raw/rendered toggle + copy), not
   just another timeline entry.
+- **File uploads** — the paperclip in the composer attaches files for the
+  agent: they land in `workspace/uploads/` (sanitized names, 50MB cap,
+  never silently overwritten) and the prompt is annotated with their
+  workspace paths so the agent can read them with its normal file tools.
+- **Clean "New"** — starting a new task clears every pane (chat, timeline,
+  terminal, editor tree, files, browser), all stats, the composer draft,
+  and any attachments.
+- **Task archiving** — every task writes a journal `.md` (description,
+  status, final output, produced-files list) into the Obsidian vault at
+  `~/Library/Mobile Documents/iCloud~md~obsidian/Documents/openmanus/`
+  (`WEBAPP_OBSIDIAN_TASKS_DIR` overrides), and files the agent produces
+  are exported to `~/Library/Mobile Documents/com~apple~CloudDocs/openmanus_output/<task>/`
+  (`WEBAPP_OUTPUT_EXPORT_DIR` overrides). Both sync via iCloud.
 - **Model management** — gear icon (or the model chip in the header) opens a
   Models dialog: switch between the profiles in `config/config.toml`, add
   custom OpenAI-compatible models with your own API keys (provider presets

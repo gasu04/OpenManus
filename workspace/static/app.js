@@ -27,6 +27,7 @@
     files: new Map(),     // path -> content cache
     activeFile: null,
     filesDirty: true,
+    uploaded: [],         // files attached this turn ({name, path, size})
     outputsDirty: true,
     intentionalClose: false,
     zoom: 1,
@@ -1085,13 +1086,22 @@
     $("browserEmpty")?.classList.remove("hidden");
     $("browserUrl").textContent = "No page loaded";
     $("editorMain").innerHTML = `<div class="pane-empty">Files the agent works on will appear here.</div>`;
+    $("editorSidebar").innerHTML = "";
+    $("filesList").innerHTML = `<div class="pane-empty">Files the agent produces will appear here.</div>`;
     $("stepStat").textContent = "Step 0/0";
     $("elapsedStat").textContent = "0:00";
+    $("tokenStat").textContent = "0 in / 0 out";
+    $("liveLabel").textContent = "Idle";
+    input.value = "";
+    autosize();
+    clearUploads();
     state.toolCards.clear();
     state.activityPill = null;
     state.actionCount = 0;
     state.activeFile = null;
     state.zoom = 1;
+    state.tokens = { in: 0, out: 0 };
+    state.runTokens = { in: 0, out: 0 };
     toolCallData.clear();
     prunedCounts.clear();
     const timelineFilter = $("timelineFilter");
@@ -1182,14 +1192,66 @@
       return;
     }
     if (decision.action === "block-running" || decision.action === "block-pending") return;
-    if (!send({ type: "run", prompt: input.value.trim() })) {
+    let prompt = input.value.trim();
+    if (state.uploaded.length) {
+      // Point the agent at the files it just received (they live in the workspace).
+      const listing = state.uploaded.map((f) => `- ${f.path} (${f.name})`).join("\n");
+      prompt = `${prompt}\n\nAttached files available in the workspace:\n${listing}`;
+    }
+    if (!send({ type: "run", prompt })) {
       addError("Send failed — prompt kept. Check the connection banner.");
       return;
     }
     state.submitPending = true;
     syncSend();
     if (decision.clearInput) { input.value = ""; autosize(); }
+    clearUploads();
   }
+
+  // ---------------------------------------------------------- file uploads
+  function renderUploadChips() {
+    const wrap = $("uploadChips");
+    wrap.classList.toggle("hidden", !state.uploaded.length);
+    wrap.innerHTML = state.uploaded
+      .map(
+        (f, i) => `
+        <span class="upload-chip" title="${esc(f.path)}">
+          <svg class="ic" aria-hidden="true"><use href="#i-paperclip"/></svg>
+          <span class="upload-chip-name">${esc(f.name)}</span>
+          <button class="upload-chip-x" data-i="${i}" aria-label="Remove ${esc(f.name)}">&times;</button>
+        </span>`
+      )
+      .join("");
+    wrap.querySelectorAll(".upload-chip-x").forEach(
+      (btn) => (btn.onclick = () => { state.uploaded.splice(+btn.dataset.i, 1); renderUploadChips(); })
+    );
+  }
+
+  function clearUploads() {
+    state.uploaded = [];
+    $("fileInput").value = "";
+    renderUploadChips();
+  }
+
+  $("btnUpload").onclick = () => $("fileInput").click();
+  $("fileInput").onchange = async (e) => {
+    const files = [...e.target.files];
+    if (!files.length) return;
+    const fd = new FormData();
+    files.forEach((f) => fd.append("files", f, f.name));
+    try {
+      const res = await fetch("/api/upload", { method: "POST", body: fd });
+      const data = await res.json();
+      if (!res.ok) { showToast(data.detail || "Upload failed", "error"); return; }
+      state.uploaded.push(...data.files);
+      renderUploadChips();
+      showToast(`${data.files.length} file${data.files.length === 1 ? "" : "s"} attached — they'll be available to the agent in the workspace`, "info", 2500);
+    } catch {
+      showToast("Upload failed (server unreachable)", "error");
+    } finally {
+      e.target.value = "";
+    }
+  };
 
   function autosize() {
     input.style.height = "auto";

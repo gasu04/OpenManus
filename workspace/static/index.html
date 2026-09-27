@@ -39,6 +39,7 @@
       <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M21 21l-4.3-4.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></symbol>
       <symbol id="i-logout" viewBox="0 0 24 24"><path d="M15 17l5-5-5-5M20 12H9M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
       <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 7V3M15 7V3M7 7h10v4a5 5 0 0 1-5 5 5 5 0 0 1-5-5zM12 16v5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+      <symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21 12.5l-8.5 8.5a5.5 5.5 0 0 1-7.78-7.78l8.5-8.5a3.67 3.67 0 0 1 5.19 5.19l-8.49 8.48a1.83 1.83 0 0 1-2.59-2.59l7.78-7.78" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     </defs>
   </svg>
 
@@ -99,7 +100,12 @@
       </div>
 
       <footer class="composer-wrap">
+        <div class="upload-chips hidden" id="uploadChips"></div>
         <div class="composer">
+          <input type="file" id="fileInput" class="hidden" multiple />
+          <button class="btn-icon" id="btnUpload" title="Attach files for the agent" aria-label="Attach files for the agent">
+            <svg class="ic"><use href="#i-paperclip"/></svg>
+          </button>
           <textarea id="promptInput" rows="1" placeholder="Give Manus a task..."></textarea>
           <button class="btn-send" id="btnSend" title="Send" disabled>
             <svg class="ic"><use href="#i-send"/></svg>
