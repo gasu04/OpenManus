@@ -751,3 +751,18 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - config/mcp.json (gitignored, 600): +9 entries (serena, github, context7, semgrep, arxiv, fetch, youtube, tavily, e2b). workspace/webapp.py: toggle reload-on-unknown. CLAUDE.md: §2.7 E2B policy. config/.gitignore: bak rule. workspace/tests/test_webapp_smoke.py: +1 test. workspace/playbooks/api-reversing.md: NEW. ~/openmanus-bin/webapp.env: WEBAPP_MAX_STEPS=50. openmanus_sessions.md: this entry.
 **Next session should:**
 - Commit the code batch (fix(web) toggle reload + docs/CLAUDE.md policy + tests + gitignore). Update the Obsidian capability spec (17 servers, ~340 tools, deep-research/recon stack, max_steps 50). arXiv search: retry from another network or later date; youtube transcripts: revisit or use yt-dlp fallback.
+
+## Session: 2026-09-27 12:10
+**Goal:** Four webapp features: agent-usable file uploads, full screen clear on New task, per-task .md journal in the openmanus Obsidian vault, output-file export to iCloud openmanus_output.
+**Completed:**
+- Uploads: POST /api/upload (multipart, auth'd, 50MB cap, traversal-sanitizing _safe_filename, timestamp-prefix on collision, paths returned workspace-relative); composer paperclip + hidden input + removable chips; prompt annotated with "Attached files available in the workspace" on send.
+- New-task clearing: resetPanes now also clears editorSidebar, filesList, tokenStat, liveLabel, composer draft, and upload chips (previously all survived "New" — the operator's exact complaint).
+- Task journal: _write_task_journal writes one .md per session (frontmatter title/date/session/status + Task description + Output + Files produced) into the Obsidian vault openmanus/ (WEBAPP_OBSIDIAN_TASKS_DIR); _export_task_outputs copies run-produced files (uploads/ excluded; is_relative_to traversal guard — fixed a latent parents-concatenation bug the new test caught) to iCloud openmanus_output/<task-slug>/ (WEBAPP_OUTPUT_EXPORT_DIR). Both env-overridable per §2.1; failures never break runs.
+- Tests: +5 (upload endpoint incl. traversal/collision/auth, journal+export units, New-clears DOM, upload-chips DOM) — suite 38/38. Fixed test-harness pollution: both suites now redirect WEBAPP_OBSIDIAN_TASKS_DIR/OUTPUT_EXPORT_DIR to temp dirs pre-import (2 fake journals had landed in the real vault; cleaned up).
+- Live E2E proof: real upload through the endpoint -> agent read the file, extracted the keyword, wrote upload-test-output.md -> journal in vault has description+output+files (content verified) and iCloud export holds the file (content verified). e2e session/artifacts cleaned. Upload UI screenshot reviewed (chip + toast render on-theme).
+**State left in:**
+- Webapp restarted with all four features live. UNCOMMITTED: webapp.py, static index/app/css (upload UI + resetPanes), both test files, README, journal.
+**Files changed:**
+- workspace/webapp.py: upload endpoint + journal/export helpers + run_agent archiving hooks + AgentSession.journal_path. workspace/static/{index.html,app.js,style.css}: upload UI + resetPanes completeness. workspace/tests/: +5 tests + temp-dir guards. workspace/README_webapp.md: feature bullets. openmanus_sessions.md: this entry.
+**Next session should:**
+- Commit this batch (feat(web): uploads, new-task clearing, task journals + output export). Refresh the Obsidian capability spec with the archiving features.
