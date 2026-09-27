@@ -1428,6 +1428,11 @@ async def toggle_mcp_server(
     built-in auto-connect resumes (a custom-configured entry is just flipped).
     """
     async with _mcp_toggle_lock:
+        # A server added directly to mcp.json while the app runs must be
+        # toggleable without a restart: refresh the in-memory registry from
+        # disk before deciding the id is unknown.
+        if server_id != _BROWSER_USE_SERVER_ID and server_id not in config.mcp_config.servers:
+            _reload_mcp_servers()
         if server_id != _BROWSER_USE_SERVER_ID and server_id not in config.mcp_config.servers:
             raise HTTPException(status_code=404, detail="Unknown MCP server")
 

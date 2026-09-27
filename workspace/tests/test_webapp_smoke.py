@@ -387,6 +387,19 @@ def test_mcp_toggle_browser_use_roundtrip(server, mcp_stub):
     assert "browser_use" not in json.loads(mcp_stub.read_text())["mcpServers"]
 
 
+def test_mcp_toggle_unknown_server_reloads_registry(server, mcp_stub):
+    """A server appended to mcp.json while the app runs must be toggleable
+    without a restart (the endpoint refreshes the registry before 404ing)."""
+    port = server
+    data = json.loads(mcp_stub.read_text())
+    data["mcpServers"]["gamma"] = {"type": "stdio", "command": "npx", "args": ["-y", "gamma"]}
+    mcp_stub.write_text(json.dumps(data))
+    # No _reload_mcp_servers() call here: the app has not seen gamma yet.
+    status, body = http("POST", "/api/mcp/servers/gamma/toggle", {"enabled": False}, port=port)
+    assert status == 200 and body["server_id"] == "gamma"
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["gamma"]["enabled"] is False
+
+
 def test_mcp_toggle_hot_applies_to_live_session(server, mcp_stub):
     port = server
 
