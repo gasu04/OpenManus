@@ -14,12 +14,13 @@ Round 2 (§2 mandatory-feature gaps + §4 reliability):
 - P1-8: tool-call inspector expands with structured args/result/status
 - P1-9: copy-to-clipboard on error messages
 - P1-10: Retry action on a failed run resends the original prompt
-- P2-4/5: client-side filters on history drawer + live timeline
+- P2-4/5: filters on the Previous Runs list (now server-side) + live timeline
 
 Run (requires the smoke-test server from test_webapp_smoke to be importable;
 boots its own): .venv/bin/python -m pytest workspace/tests/test_ui_dom.py -v
 """
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -28,6 +29,7 @@ import tempfile
 import threading
 import time
 import urllib.request
+import uuid
 from pathlib import Path
 
 import pytest
@@ -37,6 +39,13 @@ os.environ.setdefault("WEBAPP_AUTH_PASS", "testpass")
 # Keep test runs' task journals/exports out of the operator's real vault.
 os.environ.setdefault("WEBAPP_OBSIDIAN_TASKS_DIR", tempfile.mkdtemp(prefix="om-test-vault-"))
 os.environ.setdefault("WEBAPP_OUTPUT_EXPORT_DIR", tempfile.mkdtemp(prefix="om-test-export-"))
+# Keep persisted run history out of the operator's real session store.
+os.environ.setdefault("WEBAPP_SESSION_STORE_DIR", tempfile.mkdtemp(prefix="om-test-sessions-"))
+# Keep model-switch tests off the operator's real model registry (active choice).
+os.environ.setdefault(
+    "WEBAPP_MODELS_FILE",
+    str(Path(tempfile.mkdtemp(prefix="om-test-models-")) / "webapp_models.json"),
+)
 
 _spec = importlib.util.spec_from_file_location("webapp_dom_under_test", PROJECT_ROOT / "workspace" / "webapp.py")
 webapp = importlib.util.module_from_spec(_spec)
@@ -46,6 +55,8 @@ import uvicorn  # noqa: E402
 from playwright.sync_api import expect, sync_playwright  # noqa: E402
 
 AUTH = ("admin", "testpass")
+PNG = b"\x89PNG\r\n\x1a\n" + b"fake-screenshot-bytes" * 4
+PNG_B64 = __import__("base64").b64encode(PNG).decode()
 
 
 @pytest.fixture(scope="module")
@@ -155,9 +166,9 @@ def test_p1_tablist_aria_contract(page):
     page, _ = page
     expect(page.locator("#tabs")).to_have_attribute("role", "tablist")
     tabs = page.locator("#tabs [role=tab]")
-    assert tabs.count() == 5
+    assert tabs.count() == 6
     expect(tabs.first).to_have_attribute("aria-selected", "true")
-    assert page.locator("[role=tabpanel]").count() == 5
+    assert page.locator("[role=tabpanel]").count() == 6
     for label in ["btnHistory", "btnSettings", "btnNew", "btnTheme", "zoomIn", "zoomOut"]:
         assert page.locator(f"#{label}").get_attribute("aria-label"), f"#{label} missing aria-label"
 
@@ -284,15 +295,344 @@ def test_p2_timeline_filter_hides_non_matching_rows(page):
     expect(row).not_to_have_class(re.compile(r"\bhidden\b"))
 
 
-def test_p2_history_filter_hides_non_matching_rows(page):
+def on_server_loop(coro, timeout=15):
+    """Run a coroutine on the webapp's own event loop (the store is loop-bound)."""
+    return asyncio.run_coroutine_threadsafe(coro, webapp.app.state.loop).result(timeout)
+
+
+def seed_run(sid, rid, started_at, *, title, prompt, final="", status="completed", seconds=5,
+             tokens=(0, 0), files=(), events=()):
+    """Persist one finished run (with optional events) through the real store."""
+
+    async def go():
+        store = webapp.SESSION_STORE
+        await store.create_run(sid, rid, title, prompt, started_at)
+        for kind, data in events:
+            store.enqueue_event(sid, rid, {"type": kind, "data": {"ts": started_at * 1000, **data}})
+        if status != "running":
+            await store.finish_run(sid, rid, status, started_at + seconds, final, list(files), 1, 1, *tokens)
+        await store.flush(sid)
+
+    on_server_loop(go())
+
+
+def open_runs_tab(page, query=""):
+    page.evaluate("() => window.__om.switchTab('runs', true)")
+    page.evaluate("() => document.querySelector('#runBack')?.click()")  # leave any open detail
+    page.fill("#runsSearch", query)
+    if query:  # search is debounced and server-side: wait for the new results to land
+        expect(page.locator("#runsList")).to_contain_text(query, timeout=10000)
+
+
+def cards(page):
+    return page.locator("#runsList .run-card")
+
+
+def reset_runs_ui(page):
+    """Return the shared page to a neutral state between history tests."""
+    page.evaluate("() => { document.querySelector('#runBack')?.click(); }")
+    page.click("#btnNew")
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def test_btn_history_opens_previous_runs_tab_and_the_old_drawer_is_gone(page):
     page, _ = page
     page.click("#btnHistory")
-    expect(page.locator("#historyDrawer")).to_be_visible()
-    page.fill("#historySearch", "text-that-matches-nothing-at-all")
-    visible = page.locator(".history-item:not(.hidden)")
-    assert visible.count() == 0
-    page.fill("#historySearch", "")
-    page.click("#historyClose")
+    expect(page.locator("#tab-runs")).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#pane-runs")).to_be_visible()
+    assert page.locator("#historyDrawer").count() == 0
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def test_previous_runs_filters_sorts_groups_and_searches_on_the_server(page):
+    page, _ = page
+    tag, now = uuid.uuid4().hex[:8], int(time.time())
+    sid = f"dom-list-{tag}"
+    seed_run(sid, "ra", now, title=f"alpha {tag}", prompt=f"alpha prompt {tag}",
+             final=f"needle-{tag} in the answer", tokens=(10, 10), seconds=5)
+    seed_run(sid, "rb", now, title=f"beta {tag}", prompt=f"beta prompt {tag}", status="failed")
+    seed_run(sid, "rc", now - 86_400, title=f"gamma {tag}", prompt=f"gamma prompt {tag}",
+             status="stopped", seconds=50)
+    seed_run(sid, "rd", now - 5 * 86_400, title=f"delta {tag}", prompt=f"delta prompt {tag}",
+             status="interrupted")
+
+    open_runs_tab(page, tag)
+    expect(cards(page)).to_have_count(4)
+    groups = page.locator("#runsList .run-group")
+    expect(groups.nth(0)).to_have_text("Today")
+    expect(groups.nth(1)).to_have_text("Yesterday")
+    assert groups.count() == 3, "older runs get a dated heading"
+    expect(page.locator("#runsSummary")).to_contain_text("4 runs")
+    expect(page.locator("#runsSummary")).to_contain_text("success")
+
+    page.click('.run-chip[data-status="failed"]')
+    expect(page.locator('.run-chip[data-status="failed"]')).to_have_attribute("aria-pressed", "true")
+    expect(page.locator('.run-chip[data-status=""]')).to_have_attribute("aria-pressed", "false")
+    expect(cards(page)).to_have_count(1)
+    expect(cards(page).first).to_contain_text("✕ failed")  # status is not conveyed by colour alone
+    expect(page.locator("#runsSummary")).to_contain_text("1 run")
+    page.click('.run-chip[data-status=""]')
+    expect(cards(page)).to_have_count(4)
+
+    page.select_option("#runsSort", "duration")
+    expect(cards(page).first).to_contain_text(f"gamma {tag}")
+    assert page.locator("#runsList .run-group").count() == 0, "grouping applies to date sorts only"
+    page.select_option("#runsSort", "newest")
+
+    page.fill("#runsSearch", f"needle-{tag}")  # matches the final answer, server-side
+    expect(cards(page)).to_have_count(1)
+    expect(cards(page).first).to_contain_text(f"alpha {tag}")
+    page.fill("#runsSearch", "zzz-no-such-run-ever")
+    expect(page.locator(".runs-empty")).to_contain_text("No runs match")
+    page.fill("#runsSearch", "")
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def test_previous_runs_load_more_pages_through_the_list(page):
+    page, _ = page
+    tag, now = uuid.uuid4().hex[:8], int(time.time())
+    for index in range(30):
+        seed_run(f"dom-page-{tag}", f"r{index:02d}", now - index, title=f"paged {tag} {index}",
+                 prompt=f"paged prompt {tag} {index}")
+    open_runs_tab(page, tag)
+    expect(cards(page)).to_have_count(25)
+    expect(page.locator("#runsMore")).to_be_visible()
+    page.click("#runsMore")
+    expect(cards(page)).to_have_count(30)
+    expect(page.locator("#runsMore")).to_be_hidden()
+    expect(page.locator("#runsSummary")).to_contain_text("30 runs")
+    page.fill("#runsSearch", "")
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def _seed_detail_run(tag, *, status="completed"):
+    sid, rid, now = f"dom-detail-{tag}", f"run{tag}", int(time.time())
+    seed_run(
+        sid, rid, now, title=f"detail {tag}", prompt=f"detail prompt {tag}",
+        final=f"**final** answer {tag}", status=status, tokens=(120, 30), files=["notes/out.md"],
+        events=[
+            ("run_start", {"prompt": f"detail prompt {tag}"}),
+            ("thought", {"content": "thinking it over"}),
+            ("tool_start", {"id": "t1", "name": "python_execute", "category": "terminal",
+                            "arguments": {"code": "print(1)"}}),
+            ("tool_end", {"id": "t1", "name": "python_execute", "ok": True, "duration_ms": 12,
+                          "result": "1"}),
+            ("terminal", {"code": "print(1)", "output": "1"}),
+            ("browser_screenshot", {"image": PNG_B64}),
+            ("final_result", {"content": f"**final** answer {tag}"}),
+            ("run_end", {}),
+        ],
+    )
+    return sid, rid
+
+
+def test_run_detail_shows_everything_and_replay_renders_the_panes_read_only(page):
+    page, _ = page
+    tag = uuid.uuid4().hex[:8]
+    sid, rid = _seed_detail_run(tag)
+    open_runs_tab(page, tag)
+    cards(page).first.click()
+    detail = page.locator("#runDetail")
+    expect(detail).to_contain_text("Read-only historical run")
+    expect(detail.locator(".run-prompt")).to_have_text(f"detail prompt {tag}")
+    expect(detail.locator(".run-final")).to_contain_text(f"final answer {tag}")
+    expect(detail.locator(".run-files a")).to_have_text("notes/out.md")
+    expect(detail.locator("#runEventsCount")).to_have_text("8")
+    page.click("#runEventsBox summary")
+    expect(detail.locator(".run-event")).to_have_count(8)
+    expect(detail.locator(".re-shot")).to_have_attribute("src", re.compile(rf"/api/blobs/{sid}/[a-f0-9]{{32}}\.png"))
+    assert page.evaluate("() => location.hash") == f"#run={sid}/{rid}"
+
+    page.select_option("#runEventType", "tool_start,tool_end")
+    expect(detail.locator(".run-event")).to_have_count(2)
+    page.select_option("#runEventType", "")
+
+    page.click("#runReplay")
+    expect(page.locator("#replayBanner")).to_be_visible()
+    expect(page.locator("#replayLabel")).to_contain_text("Replaying")
+    expect(page.locator("#replayLabel")).to_contain_text("read-only")
+    expect(page.locator('.tl-tool[data-call-id="t1"]')).to_be_visible()
+    expect(page.locator(".msg-user .bubble").last).to_contain_text(f"detail prompt {tag}")
+    expect(page.locator("#browserShot")).to_have_attribute("src", re.compile(r"/api/blobs/"))
+    expect(page.locator("#promptInput")).to_be_disabled()
+    expect(page.locator("#btnSend")).to_be_disabled()
+    page.evaluate("() => window.__om.switchTab('terminal', true)")
+    expect(page.locator("#terminal")).to_contain_text("print(1)")
+
+    # live traffic must not leak into a replayed run
+    page.evaluate("() => window.__om.state.ws?.onmessage({data: JSON.stringify({type:'thought', data:{content:'LIVE-INTRUSION'}})})")
+    assert "LIVE-INTRUSION" not in page.locator("#messages").inner_text()
+
+    page.click("#replayExit")
+    expect(page.locator("#replayBanner")).to_be_hidden()
+    expect(page.locator("#promptInput")).to_be_enabled()
+    page.wait_for_function("() => window.__om.state.ws?.readyState === 1", timeout=15000)
+    assert page.evaluate("() => window.__om.state.replayMode") is None
+    reset_runs_ui(page)
+
+
+def test_run_actions_rerun_continue_copy_export_and_delete(page):
+    page, _ = page
+    tag = uuid.uuid4().hex[:8]
+    sid, rid = _seed_detail_run(tag)
+    open_runs_tab(page, tag)
+    cards(page).first.click()
+    expect(page.locator("#runDetail")).to_contain_text("Read-only historical run")
+    original_sid = page.evaluate("() => window.__om.state.sessionId")
+
+    page.locator("#runDetail .run-section").first.locator(".copy-btn").click()
+    assert page.evaluate("() => navigator.clipboard.readText()") == f"detail prompt {tag}"
+
+    with page.expect_download() as download_info:
+        page.click("#runExportJson")
+    exported = json.loads(Path(download_info.value.path()).read_text())
+    assert exported["run"]["id"] == rid and len(exported["events"]) == 8
+    assert "sk-" not in json.dumps(exported)
+    with page.expect_download() as download_info:
+        page.click("#runExportMd")
+    markdown_text = Path(download_info.value.path()).read_text()
+    assert f"# detail {tag}" in markdown_text and "## Final response" in markdown_text
+    assert "notes/out.md" in markdown_text and "## Timeline" in markdown_text
+
+    page.click("#runRerun")  # new session; prompt prefilled but never auto-submitted
+    expect(page.locator("#promptInput")).to_have_value(f"detail prompt {tag}")
+    assert page.evaluate("() => window.__om.state.sessionId") != original_sid
+    expect(page.locator(".msg-user .bubble")).to_have_count(0)
+    expect(page.locator(".toast", has_text="Prompt copied")).to_be_visible()
+
+    open_runs_tab(page, tag)
+    cards(page).first.click()
+    page.click("#runContinue")
+    seeded = page.input_value("#promptInput")
+    assert seeded.startswith("Context from an earlier run")
+    assert "not restored" in seeded
+    assert f"detail prompt {tag}" in seeded and f"final** answer {tag}" in seeded
+    assert seeded.rstrip().endswith("New request:")
+    expect(page.locator(".toast", has_text="agent's state is not restored")).to_be_visible()
+
+    open_runs_tab(page, tag)
+    cards(page).first.click()
+    page.click("#runDelete")
+    dialog = page.locator(".confirm-modal")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_contain_text("ALL of its runs")
+    dialog.locator('[data-x="cancel"]').click()
+    assert webapp.SESSION_STORE.get_session(sid) is not None, "cancel must not delete anything"
+    page.click("#runDelete")
+    page.locator(".confirm-modal").locator('[data-x="ok"]').click()
+    expect(page.locator("#runDetail")).to_be_hidden()
+    expect(cards(page)).to_have_count(0)
+    assert webapp.SESSION_STORE.get_session(sid) is None
+    reset_runs_ui(page)
+
+
+def test_run_detail_deep_link_back_navigation_scroll_and_focus(page):
+    page, _ = page
+    tag, now = uuid.uuid4().hex[:8], int(time.time())
+    for index in range(14):
+        seed_run(f"dom-nav-{tag}", f"n{index:02d}", now - index, title=f"nav {tag} {index}",
+                 prompt=f"nav prompt {tag} {index}", final="x" * 200)
+    open_runs_tab(page, tag)
+    expect(cards(page)).to_have_count(14)
+    page.set_viewport_size({"width": 1100, "height": 420})
+    page.evaluate("() => { document.querySelector('#pane-runs').scrollTop = 260; }")
+    scrolled = page.evaluate("() => document.querySelector('#pane-runs').scrollTop")
+    assert scrolled > 0
+    target = page.locator('.run-card[data-run-id="n09"]')
+    target.evaluate("el => el.click()")
+    expect(page.locator("#runDetail")).to_contain_text("Read-only historical run")
+    assert page.evaluate("() => document.activeElement.id") == "runDetailTitle"
+    page.click("#runBack")
+    expect(page.locator("#runsListView")).to_be_visible()
+    assert abs(page.evaluate("() => document.querySelector('#pane-runs').scrollTop") - scrolled) <= 4
+    assert page.evaluate("() => document.activeElement.dataset.runId") == "n09"
+    assert page.evaluate("() => location.hash").startswith("#s="), "back restores the session hash"
+    page.set_viewport_size({"width": 1280, "height": 720})
+
+    # deep link: pasting #run=<session>/<run> opens the detail, and survives a reload
+    link = f"#run=dom-nav-{tag}/n03"
+    page.evaluate(f"() => {{ location.hash = '{link}'; }}")
+    expect(page.locator("#runDetail")).to_contain_text(f"nav prompt {tag} 3")
+    page.reload(wait_until="networkidle")
+    page.wait_for_function("() => window.__om && window.__om.state.ws?.readyState === 1")
+    expect(page.locator("#tab-runs")).to_have_attribute("aria-selected", "true")
+    expect(page.locator("#runDetail")).to_contain_text(f"nav prompt {tag} 3")
+    assert page.evaluate("() => window.__om.state.sessionId") != f"dom-nav-{tag}", (
+        "a run link must not adopt the historical session"
+    )
+    page.click("#runBack")
+    page.fill("#runsSearch", "")
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def test_previous_runs_are_keyboard_operable(page):
+    page, _ = page
+    tag, now = uuid.uuid4().hex[:8], int(time.time())
+    seed_run(f"dom-kb-{tag}", "ok1", now, title=f"kb ok {tag}", prompt=f"kb prompt {tag}")
+    seed_run(f"dom-kb-{tag}", "bad1", now, title=f"kb bad {tag}", prompt=f"kb prompt {tag}",
+             status="failed")
+    open_runs_tab(page, tag)
+    expect(cards(page)).to_have_count(2)
+    chip = page.locator('.run-chip[data-status="failed"]')
+    chip.focus()
+    page.keyboard.press("Enter")
+    expect(chip).to_have_attribute("aria-pressed", "true")
+    expect(cards(page)).to_have_count(1)
+    cards(page).first.focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("#runDetail")).to_contain_text("Read-only historical run")
+    assert page.evaluate("() => document.activeElement.id") == "runDetailTitle"
+    page.locator("#runBack").focus()
+    page.keyboard.press("Enter")
+    expect(page.locator("#runsListView")).to_be_visible()
+    assert page.evaluate("() => document.activeElement.dataset.runId") == "bad1"
+    page.click('.run-chip[data-status=""]')
+    page.fill("#runsSearch", "")
+    page.evaluate("() => window.__om.switchTab('live', true)")
+
+
+def test_opening_a_historical_session_from_a_run_is_a_read_only_chat(page):
+    page, _ = page
+    tag = uuid.uuid4().hex[:8]
+    _seed_detail_run(tag)
+    open_runs_tab(page, tag)
+    cards(page).first.click()
+    page.click("#runOpenSession")
+    page.wait_for_function("() => window.__om.state.ws?.readyState === 1", timeout=15000)
+    expect(page.locator("#promptInput")).to_be_disabled()
+    expect(page.locator("#promptInput")).to_have_attribute("placeholder", re.compile("read-only"))
+    expect(page.locator(".msg-user .bubble").first).to_contain_text(f"detail prompt {tag}")
+    page.evaluate("() => window.__om.submitPrompt()")
+    expect(page.locator(".toast", has_text="read-only")).to_be_visible()
+    reset_runs_ui(page)
+
+
+def test_session_window_note_history_banner_tab_badge_and_live_dot(page):
+    page, _ = page
+    page.evaluate("() => window.__om.dispatch('session_info', {read_only: true, runs_total: 5, runs_shown: 2})")
+    expect(page.locator(".toast", has_text="latest 2 of 5 runs")).to_be_visible()
+    page.evaluate("() => window.__om.dispatch('session_info', {read_only: false})")
+
+    page.evaluate("() => window.__om.dispatch('history_degraded', {message: 'Run history is not being saved right now.'})")
+    banner = page.locator("#historyBanner")
+    expect(banner).to_be_visible()
+    expect(banner).to_have_attribute("role", "alert")
+    expect(banner).to_contain_text("not being saved")
+    page.evaluate("() => window.__om.dispatch('history_recovered', {message: 'Run history saving has recovered.'})")
+    expect(banner).to_be_hidden()
+    expect(page.locator(".toast", has_text="recovered")).to_be_visible()
+
+    page.evaluate("() => window.__om.dispatch('run_start', {prompt: 'live dot probe', ts: Date.now()})")
+    expect(page.locator("#runsLiveDot")).to_be_visible()
+    page.evaluate("() => window.__om.dispatch('run_end', {ts: Date.now()})")
+    expect(page.locator("#runsLiveDot")).to_be_hidden()
+
+    seed_run(f"dom-badge-{uuid.uuid4().hex[:8]}", "b1", int(time.time()), title="badge", prompt="badge")
+    page.reload(wait_until="networkidle")
+    page.wait_for_function("() => window.__om && window.__om.state.ws?.readyState === 1")
+    badge = page.locator("#runsBadge")
+    expect(badge).to_be_visible()
+    assert int(badge.inner_text()) >= 1
 
 
 # ------------------------------------------------------------- MCP modal --
@@ -480,11 +820,181 @@ def test_upload_chips_flow(page, tmp_path, monkeypatch):
     assert errors[errors_before:] == []
 
 
+# ------------------------------------------- audit-fix regression tests --
+# Guards for the 2026-09-27 website-audit.md findings (see audit report for
+# evidence/acceptance criteria). These must stay above the logout test —
+# that one ends the shared page's session by design.
+
+
+def test_bug_header_actions_never_overflow_chat_panel(page):
+    """BUG-001/002: header actions must stay inside the chat panel on desktop
+    and remain on-screen at mobile width (previously overlapped the computer
+    panel title / were clipped off-viewport entirely)."""
+    page, _ = page
+    page.set_viewport_size({"width": 1440, "height": 900})
+    m = page.evaluate(
+        """() => {
+          const a = document.querySelector('.header-actions').getBoundingClientRect();
+          const p = document.getElementById('chatPanel').getBoundingClientRect();
+          return { actionsRight: a.right, panelRight: p.right };
+        }"""
+    )
+    assert m["actionsRight"] <= m["panelRight"] + 1, (
+        f"header actions overflow the chat panel by {m['actionsRight'] - m['panelRight']:.0f}px"
+    )
+    page.set_viewport_size({"width": 390, "height": 844})
+    on_screen = page.evaluate(
+        """() => ['btnTheme','btnLogout','btnHistory','btnMcp','btnSettings','btnNew'].every(id => {
+          const r = document.getElementById(id).getBoundingClientRect();
+          return r.width > 0 && r.left >= 0 && r.right <= window.innerWidth;
+        })"""
+    )
+    assert on_screen, "all header buttons must be reachable at 390px"
+    page.set_viewport_size({"width": 1280, "height": 720})
+
+
+def test_bug_tabs_scrollable_at_mobile_width(page):
+    """BUG-003: the tab bar scrolls horizontally instead of clipping the
+    Files tab off-screen at 390px."""
+    page, _ = page
+    page.set_viewport_size({"width": 390, "height": 844})
+    overflow = page.evaluate("() => getComputedStyle(document.getElementById('tabs')).overflowX")
+    assert overflow == "auto"
+    page.locator("#tab-files").scroll_into_view_if_needed()
+    page.click("#tab-files")
+    expect(page.locator("#pane-files")).to_be_visible()
+    page.set_viewport_size({"width": 1280, "height": 720})
+
+
+def test_a11y_dialog_semantics_focus_trap_and_return(page):
+    """A11Y-003: modals are named modal dialogs; focus moves in on open, Tab
+    is trapped, Escape closes, focus returns to the trigger."""
+    page, _ = page
+    page.click("#btnSettings")
+    dlg = page.locator("#modelModal .modal")
+    expect(dlg).to_have_attribute("role", "dialog")
+    expect(dlg).to_have_attribute("aria-modal", "true")
+    expect(dlg).to_have_attribute("aria-labelledby", "modelModalTitle")
+    inside = page.evaluate(
+        "() => document.getElementById('modelModal').contains(document.activeElement)"
+    )
+    assert inside, "focus must move into the dialog on open"
+    page.evaluate(
+        """() => {
+          const els = [...document.querySelectorAll('#modelModal button, #modelModal input, #modelModal select')]
+            .filter(e => e.offsetParent !== null);
+          els[els.length - 1].focus();
+        }"""
+    )
+    page.keyboard.press("Tab")
+    wrapped = page.evaluate(
+        "() => document.getElementById('modelModal').contains(document.activeElement)"
+    )
+    assert wrapped, "Tab past the last control must wrap inside the dialog"
+    page.keyboard.press("Escape")
+    expect(page.locator("#modelModal")).to_be_hidden()
+    assert page.evaluate("() => document.activeElement.id") == "btnSettings"
+
+
+def test_a11y_model_cards_are_keyboard_operable_radios(page):
+    """A11Y-005: model cards form a real radiogroup — roving tabindex, arrow
+    keys move the tab stop, aria-checked reflects the active model."""
+    page, _ = page
+    page.click("#btnSettings")
+    cards = page.locator("#modelList [role=radio]")
+    expect(cards.first).to_be_visible(timeout=5000)
+    assert cards.count() >= 1
+    assert page.locator('#modelList [role=radio][aria-checked="true"]').count() == 1
+    stops = page.evaluate(
+        "() => [...document.querySelectorAll('#modelList [role=radio]')].filter(c => c.tabIndex === 0).length"
+    )
+    assert stops == 1, "exactly one card is the tab stop (roving tabindex)"
+    page.evaluate("() => document.querySelector('#modelList [role=radio]').focus()")
+    page.keyboard.press("ArrowDown")
+    moved = page.evaluate(
+        """() => {
+          const cards = [...document.querySelectorAll('#modelList [role=radio]')];
+          if (cards.length < 2) return true; // single-card groups have nothing to move to
+          return document.activeElement === cards[1] && cards[1].tabIndex === 0 && cards[0].tabIndex === -1;
+        }"""
+    )
+    assert moved
+    page.keyboard.press("Escape")
+
+
+def test_a11y_composer_and_preset_have_accessible_names(page):
+    """A11Y-004: composer textarea and preset select expose accessible names."""
+    page, _ = page
+    assert page.locator("#promptInput").get_attribute("aria-label")
+    page.click("#btnSettings")
+    expect(page.locator("#fPreset")).to_have_attribute("aria-label", "Provider preset")
+    page.keyboard.press("Escape")
+
+
+def test_a11y_primary_button_contrast_both_themes(page):
+    """A11Y-001: .btn-primary text clears WCAG AA 4.5:1 in dark AND light."""
+    page, _ = page
+    ratio_js = """() => {
+        const lum = (rgb) => {
+          const c = rgb.match(/[\\d.]+/g).map(Number);
+          const f = (v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4); };
+          return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]);
+        };
+        const cs = getComputedStyle(document.getElementById('formSave'));
+        const l1 = lum(cs.color), l2 = lum(cs.backgroundColor);
+        return (Math.max(l1, l2) + 0.05) / (Math.min(l1, l2) + 0.05);
+    }"""
+    page.click("#btnSettings")
+    expect(page.locator("#formSave")).to_be_visible()
+    dark_ratio = page.evaluate(ratio_js)
+    assert dark_ratio >= 4.5, f"dark theme .btn-primary contrast {dark_ratio:.2f}:1 < 4.5:1"
+    page.keyboard.press("Escape")
+    page.click("#btnTheme")
+    page.click("#btnSettings")
+    light_ratio = page.evaluate(ratio_js)
+    assert light_ratio >= 4.5, f"light theme .btn-primary contrast {light_ratio:.2f}:1 < 4.5:1"
+    page.keyboard.press("Escape")
+    page.click("#btnTheme")  # restore dark for subsequent tests
+
+
+def test_ux_signout_confirm_is_inline_and_cancellable(page):
+    """UX-006: sign-out gates on the styled inline confirm; Cancel keeps the
+    session alive (a native confirm() would auto-dismiss and fail this test)."""
+    page, _ = page
+    page.click("#btnLogout")
+    dlg = page.locator(".confirm-modal")
+    expect(dlg).to_be_visible(timeout=3000)
+    expect(dlg).to_have_attribute("role", "alertdialog")
+    expect(dlg).to_contain_text("Sign out?")
+    dlg.locator('[data-x="cancel"]').click()
+    expect(page.locator(".confirm-modal")).to_have_count(0)
+    expect(page.locator("#promptInput")).to_be_visible()  # still signed in
+
+
+def test_ux_run_report_uses_event_timestamps_on_replay(page):
+    """UX-002: replayed run renders durations from event ts, not 0:00."""
+    page, _ = page
+    page.evaluate(
+        """() => {
+          const t0 = Date.now() - 65000; // run started 65s ago
+          window.__om.dispatch('run_start', { prompt: 'ts-replay-probe', ts: t0 });
+          window.__om.dispatch('thought', { content: 'thinking', ts: t0 + 42000 });
+          window.__om.dispatch('run_end', { ts: t0 + 65000 });
+        }"""
+    )
+    expect(page.locator(".tl-report").last).to_contain_text("1:05")
+    expect(page.locator("#elapsedStat")).to_have_text("1:05")
+
+
 def test_logout_invalidates_the_session_server_side(page):
     page, _ = page
     old_cookie = next(c for c in page.context.cookies() if c["name"] == "om_session")
-    page.on("dialog", lambda d: d.accept())  # confirm() on the logout button
     page.click("#btnLogout")
+    # UX-006: inline styled confirm (role=alertdialog), not a native confirm().
+    confirm = page.locator(".confirm-modal")
+    expect(confirm).to_be_visible(timeout=3000)
+    expect(confirm).to_have_attribute("role", "alertdialog")
+    confirm.locator('[data-x="ok"]').click()
     page.wait_for_load_state("networkidle")
     expect(page.locator("#f input#u")).to_be_visible(timeout=5000)  # back at the login form
     # Prove *server-side* invalidation, not just the client forgetting the

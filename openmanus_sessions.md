@@ -766,3 +766,66 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - workspace/webapp.py: upload endpoint + journal/export helpers + run_agent archiving hooks + AgentSession.journal_path. workspace/static/{index.html,app.js,style.css}: upload UI + resetPanes completeness. workspace/tests/: +5 tests + temp-dir guards. workspace/README_webapp.md: feature bullets. openmanus_sessions.md: this entry.
 **Next session should:**
 - Commit this batch (feat(web): uploads, new-task clearing, task journals + output export). Refresh the Obsidian capability spec with the archiving features.
+
+## Session: 2026-09-27 23:15
+**Goal:** Full QA audit of the OpenManus webapp (http://127.0.0.1:8000) per operator's UI/UX audit prompt; deliverable website-audit.md.
+**Completed:**
+- Playwright audit harness (4 scripts) run against the live webapp: unauth/login flows, app shell, all tabs, both modals, history drawer, theme, upload UI, contrast measurements, keyboard/a11y DOM scans, desktop/tablet/mobile viewports, plus one approved minimal agent run ("Reply with exactly: OK") observed via event-log replay.
+- 18 findings written to /Volumes/990PRO 4T/openmanus-audit/website-audit.md with 43 evidence screenshots. Headline: UX-001 (no UI feedback for 60-90s after prompt submit during MCP init), BUG-001/BUG-002 (chat-header overflow: mobile buttons off-screen, desktop covers computer-panel title), A11Y-001 (.btn-primary 1.22:1 contrast in dark theme), A11Y-002 (faint text 2.37-3.50:1), UX-002 (all run durations 0:00 on replay), BUG-003 (Files tab unreachable on mobile), modal/radio/label a11y gaps.
+- Run also revealed agent-side cost: trivial prompt -> 9-step loop, ~810k-3.87M tokens (OBS-001, MCP tool surface).
+**State left in:**
+- Webapp untouched and running; no config/data mutated (no model/MCP/session changes). Test upload removed from workspace/uploads. One completed agent session ("Reply with exactly: OK") remains in in-memory history + its Obsidian journal (normal app behavior).
+**Files changed:**
+- /Volumes/990PRO 4T/openmanus-audit/: website-audit.md, screenshots/, audit_*.py, audit_*.json (NEW audit artifacts, outside the repo).
+- openmanus_sessions.md: this entry.
+**Next session should:**
+- Fix P1 batch: UX-001 submit-feedback pending state; BUG-001/002 chat-header overflow (one root cause); A11Y-001 .btn-primary theme-aware colors. Report has acceptance criteria + agent-harness task list (§11).
+
+## Session: 2026-09-28 09:00
+**Goal:** Apply every code-actionable finding from the 2026-09-27 website audit (openmanus-audit/website-audit.md).
+**Completed:**
+- UX-001: run_start now emitted before _ensure_agent() (was after 60-90s MCP init); block-pending re-submit shows a toast. Verified live: bubble+Working+Stop within 2s of submit; stop lands mid-init.
+- BUG-001/002: .chat-header flex-wrap + model-chip max-width; desktop no longer overlaps computer title (304px<=440px), all 6 buttons reachable at 390px.
+- A11Y-001: .btn-primary/.tab .badge use accent + per-theme --btn-text (6.13:1 dark, 6.29:1 light). A11Y-002: --text-faint re-tokened (5.23:1 light, 4.94:1 dark).
+- BUG-003: .tabs overflow-x auto. UX-005: welcome margin 4vh on mobile. UX-007: prefers-reduced-motion block.
+- UX-002: send_event embeds server ts (epoch ms) in every event payload; frontend renders durations event-relative (fmtEventTime) on live+replay; elapsed clock anchored to run_start ts; end-of-run report uses run_end ts.
+- A11Y-003: role=dialog/aria-modal/aria-labelledby both modals + shared openDialog/closeDialog (focus in on open, Tab trap, global-Escape close, focus return). A11Y-004: aria-labels on #promptInput/#fPreset. A11Y-005: model cards real radiogroup (roving tabindex, arrows, Enter/Space).
+- UX-003: history no-match empty note. UX-004: direction-neutral welcome copy + OpenManus naming. UX-006: styled alertdialog confirmDialog replaces native confirm() (sign-out + model delete). SEC-001: nosniff/XFO/Referrer-Policy/CSP on all responses. SEC-002: minimal health body.
+- Tests 38->49 (+11: run_start ordering w/ slow-create knob, security headers, header overflow, tab scroll, dialog a11y, radios, labels, contrast both themes, inline confirm, no-match note, replay durations); suite 49/49 green. Logout test updated for inline confirm.
+- SIDE EFFECT FIXED: pre-existing test_model_switch_broadcasts_control_event clobbered the operator's real active model (shared webapp_models.json). Added WEBAPP_MODELS_FILE env override; both suites redirect to temp registries; operator's active model restored to user:811acf11 via API. Custom model entries were never touched.
+- Live verification: audit_verify_fixes.py 18/18 pass (screenshots FIX-*.png); webapp restarted under launchd and healthy.
+**State left in:**
+- Webapp running with all fixes live; operator state restored; OBS-001 (MCP tool-surface cost) left as operator decision (no config touched). UNCOMMITTED: webapp.py, static index/app/css, both test files, README_webapp.md, journal. ms-playwright: chromium(_headless_shell)-1243 symlinks -> 1200 (Playwright 1.63 revision pin; additive).
+**Files changed:**
+- workspace/webapp.py: early run_start, event ts, security headers, minimal health, WEBAPP_MODELS_FILE. workspace/static/style.css: header wrap, tabs scroll, btn-primary/badge tokens, text-faint tokens, welcome margin, reduced-motion, confirm modal. workspace/static/index.html: dialog roles/labelledby, aria-labels, radiogroup, copy. workspace/static/app.js: fmtEventTime + ts wiring, dialog helpers + confirmDialog, radios keyboard, pending toast, no-match note. workspace/tests/: +11 tests + isolation fix. workspace/README_webapp.md: env table row. openmanus_sessions.md: this entry.
+**Next session should:**
+- Commit this batch (fix(web): apply website-audit findings, 49/49). Operator decision: OBS-001 MCP tool-surface cost (17 servers, ~340 tools in every context). Optionally externalize the login page's inline script/style to drop 'unsafe-inline' from CSP.
+
+## Session: 2026-11-01
+**Goal:** Add a Previous Runs portal tab and persistent disk-backed session/run/event history inside the OpenManus directory.
+**Completed:**
+- Added `workspace/session_store.py`: per-session `session.json` + append-only `events.jsonl`; atomic mode-600 metadata writes, per-session async locks, cancellation-safe worker completion, path confinement, corrupt-record handling, multi-run summaries, and startup reconciliation of interrupted runs using each run's last event timestamp (not restart time).
+- Integrated persistence into `workspace/webapp.py`: unique run IDs, run status/duration/steps/actions/token/final-response/produced-file metadata, complete event persistence independent of the 2,000-event RAM cap, authenticated `/api/runs*` endpoints, disk-backed session listing/deletion, lazy historical WebSocket replay, read-only enforcement, repeated-stop finalization guard, and deleted-session rerun/recreation protection. History-list disk scans are offloaded from the event loop.
+- Added the Previous Runs tab (`workspace/static/`): individual-run cards, prompt filter, status/timing/action/step/token/file summaries, read-only detail view with prompt/final response/files and up to the latest 400 events; complete history remains available through the API/disk log. Historical sessions restored through the existing drawer are read-only.
+- Added `session_store/` in the project root (mode 700), gitignored runtime data while keeping the new source module trackable. Updated `README_webapp.md`, `UI_ENGAGEMENT.md`, and test isolation so suites never touch the operator's real store.
+- Added storage, restart/replay, multi-turn, RAM-cap, corruption, deletion, cancellation-race, API-auth, and Previous Runs DOM regression coverage. Full result: 60 pytest tests + 8 node tests pass; JS and Python compile checks and `git diff --check` pass. Two read-only review passes found and prompted fixes for deletion races, repeated stop, semantic corruption, duration inflation, export-independent file history, and blocking scans.
+**State left in:**
+- Implementation complete and tested. The currently running production webapp was NOT restarted, avoiding interruption/loss of its pre-existing volatile sessions; the new feature becomes live after the next webapp restart. No git mutations performed.
+**Files changed:**
+- `.gitignore`; `workspace/session_store.py` (new); `workspace/webapp.py`; `workspace/static/{index.html,app.js,style.css}`; `workspace/tests/test_session_store.py` (new), `test_webapp_smoke.py`, `test_ui_dom.py`; `workspace/README_webapp.md`; `workspace/UI_ENGAGEMENT.md`; `openmanus_sessions.md` (this entry).
+**Next session should:**
+- With operator confirmation, restart the webapp and perform live restart/replay acceptance. Existing pre-restart in-memory history cannot be recovered by the new store; all new runs will persist automatically. Commit only if the operator asks.
+
+## Session: 2026-11-01 (history hardening, efficiency, UI)
+**Goal:** Harden, speed up, and improve the UI of the persistent run history (Phases 1-3 of the follow-up prompt).
+**Completed:**
+- **Hardening:** a disk failure can no longer fail or cancel a run — event writes go through a bounded per-session writer queue with retry (exponential backoff + jitter), a circuit breaker with a single half-open probe, and `history_degraded`/`history_recovered` client events plus a banner; run completions that cannot be saved are remembered and written on recovery (or recorded by an upsert at finish). Secrets are redacted before persistence (built-in token shapes, bearer/authorization, key-value and JSON-key rules, configurable extras); long strings are truncated with markers; screenshots are offloaded to `blobs/` (authenticated, path-confined `/api/blobs`). Retention by age/size (`WEBAPP_HISTORY_MAX_AGE_DAYS/MAX_BYTES`, `POST /api/history/prune`, background loop; running sessions never deleted). Terminal events fsync. The store is built in the FastAPI lifespan (no import-time I/O; portal still serves if it fails to start). Idle agent eviction (`WEBAPP_AGENT_IDLE_MINUTES`, default off) releases MCP processes and leaves read-only history. Authenticated `GET /api/health/detail`; schema versioning with a no-op migration (future versions are skipped, never overwritten).
+- **Efficiency:** derived, rebuildable `index.json` (stat-based staleness check) serves `/api/runs` from memory with cursor pagination, status/date filters, sorting, server-side search and a match summary; run detail streams events with `offset/limit/types` and never inlines images; writer queue batches appends over a kept-open descriptor (idle writers release it); restored sessions replay whole runs newest-first within the 2,000-event window and report how many runs are shown.
+- **UI:** old history drawer removed (clock icon opens Previous Runs); status chips, sort, day grouping, load-more, summary bar, tab count badge + live-run dot, paged event inspector with copy/screenshots, **Open replay** through the real panes (read-only, exit banner), Open session, Re-run, Continue (seeded text, state NOT restored), Markdown/JSON export, confirmed delete, `#run=` deep links, scroll/focus restore, keyboard operation, status glyphs.
+- **Verification:** 121 pytest (helpers 22, store 29, smoke 32, DOM 38) + 8 node pass; mypy: new modules clean, `webapp.py` identical to its 7 pre-existing findings; ruff: new modules clean, zero findings on lines added to `webapp.py`; black clean on new files. Real restart drill against a throwaway instance (own port, temp store, stub agent): 43/43 checks x3 runs — SIGKILL mid-run, restart on same store, interrupted duration from last event, redaction on every file on disk, screenshots decode in a real browser after restart, restored sessions read-only, `index.json` deletion rebuilt identically, simulated full disk (run healthy, banner, recovery, identical event sequence, 0 dropped).
+**State left in:**
+- Implementation complete. The production LaunchAgent (:8000, PID 83693) was NOT restarted and still runs the pre-change code; none of this is live until the operator restarts it. Production `session_store/` is the empty mode-700 directory. Nothing committed. `black` would still reformat the pre-existing `workspace/webapp.py` (not reformatted here to keep the diff reviewable); ruff's pyupgrade rules flag the file's `typing.Dict/Optional` style (pre-existing, not changed outside my additions).
+**Files changed:**
+- New: `workspace/history_config.py`, `history_redaction.py`, `history_resilience.py`, `workspace/tests/test_history_helpers.py`. Rewritten: `workspace/session_store.py`, `workspace/tests/test_session_store.py`. Modified: `workspace/webapp.py`, `workspace/static/{index.html,app.js,style.css}`, `workspace/tests/test_webapp_smoke.py`, `test_ui_dom.py`, `workspace/README_webapp.md`, `UI_ENGAGEMENT.md`, `.gitignore` (allowlist `workspace/history_*.py`), `openmanus_sessions.md`.
+**Next session should:**
+- With operator approval, restart the LaunchAgent to activate (history from before the first persistence restart cannot be recovered). Optionally set `WEBAPP_HISTORY_MAX_AGE_DAYS`/`MAX_BYTES` and `WEBAPP_AGENT_IDLE_MINUTES` in `~/openmanus-bin/webapp.env` (all default off). Commit only if asked; the three `history_*.py` modules and tests must be included.

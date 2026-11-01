@@ -4,10 +4,13 @@ logs/
 
 # Data
 data/
+session_store/
 
 # Workspace (keep the web UI; ignore runtime artifacts and secrets)
 workspace/*
 !workspace/webapp.py
+!workspace/session_store.py
+!workspace/history_*.py
 !workspace/run_webapp.sh
 !workspace/*.md
 !workspace/static/

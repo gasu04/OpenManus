@@ -25,6 +25,13 @@ Configuration (environment variables):
                                           workspace/REMOTE_ACCESS_ENGAGEMENT.md).
     WEBAPP_HOST / WEBAPP_PORT             Bind address (default 127.0.0.1:8000).
     WEBAPP_MAX_STEPS                      Agent step limit (default 30).
+    WEBAPP_SESSION_STORE_DIR              Persistent run-history directory
+                                          (default: PROJECT_ROOT/session_store).
+    WEBAPP_HISTORY_*                      History limits, retention, redaction
+                                          and resilience (see HistoryConfig and
+                                          workspace/README_webapp.md).
+    WEBAPP_AGENT_IDLE_MINUTES             Release idle agents' MCP processes
+                                          after this long (default 0 = off).
     WEBAPP_ALLOWED_ORIGINS                Comma-separated Origin allowlist for
                                           CSRF/WS-Origin checks (default:
                                           http(s)://127.0.0.1 and localhost at
@@ -57,6 +64,8 @@ import shutil
 import sys
 import time
 import traceback
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -80,6 +89,8 @@ from app.config import LLMSettings, MCPSettings, config
 from app.llm import LLM
 from app.logger import logger
 from app.schema import ToolCall
+from workspace.history_config import HistoryConfig
+from workspace.session_store import SessionStore, SessionStoreError, StoreIOError
 
 # ---------------------------------------------------------------------------
 # Configuration (all overridable via environment; no hardcoded runtime values)
@@ -93,6 +104,19 @@ MAX_FILE_BYTES = 1_000_000       # refuse to serve files larger than this
 MAX_EVENT_LOG = 2000             # per-session replay buffer
 HUMAN_REPLY_TIMEOUT = 600        # seconds to wait for ask_human answer
 SNAPSHOT_BYTES = 200_000         # max file content pushed in file_update events
+SESSION_STORE_DIR = Path(
+    os.environ.get("WEBAPP_SESSION_STORE_DIR", PROJECT_ROOT / "session_store")
+).expanduser()
+# Created in the application lifespan so importing this module does no store I/O.
+SESSION_STORE: SessionStore | None = None
+HISTORY_INIT_ERROR: str | None = None       # error class if the store failed to start
+AGENT_IDLE_MINUTES = float(os.environ.get("WEBAPP_AGENT_IDLE_MINUTES", "0") or 0)
+AGENT_IDLE_CHECK_SECONDS = float(os.environ.get("WEBAPP_AGENT_IDLE_CHECK_SECONDS", "60"))
+RUNS_PAGE_MAX = int(os.environ.get("WEBAPP_RUNS_PAGE_MAX", "200"))
+EVENTS_PAGE_MAX = int(os.environ.get("WEBAPP_EVENTS_PAGE_MAX", "2000"))
+PENDING_FINISH_MAX = int(os.environ.get("WEBAPP_HISTORY_PENDING_FINISH_MAX", "100"))
+PENDING_FINISHES: list[dict[str, Any]] = []     # run completions awaiting disk recovery
+_BACKGROUND_TASKS: set = set()                  # strong refs so tasks aren't GC'd
 
 
 def _safe_filename(name: str) -> str:
@@ -396,7 +420,46 @@ def _destroy_session(token: Optional[str]) -> None:
         _sessions.pop(token, None)
 
 
-app = FastAPI(title="OpenManus Web")
+@asynccontextmanager
+async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
+    """Start the run-history store and maintenance tasks; stop them on shutdown.
+
+    The store is built here, not at import time. If it cannot start (for
+    example the external volume is unmounted) the portal still serves, runs
+    simply are not recorded, and ``/api/health/detail`` reports it unhealthy.
+    """
+    global SESSION_STORE, HISTORY_INIT_ERROR
+    app_.state.loop = asyncio.get_running_loop()
+    HISTORY_INIT_ERROR = None
+    try:
+        SESSION_STORE = await asyncio.to_thread(
+            SessionStore, SESSION_STORE_DIR, HistoryConfig.from_env(), _on_history_state
+        )
+    except SessionStoreError as exc:
+        SESSION_STORE = None
+        HISTORY_INIT_ERROR = type(exc).__name__
+        logger.error(f"Run history unavailable at startup ({HISTORY_INIT_ERROR})")
+    background: list[asyncio.Task] = []
+    if AGENT_IDLE_MINUTES > 0:
+        background.append(asyncio.create_task(_idle_eviction_loop()))
+    store = SESSION_STORE
+    if store is not None and (store.config.max_age_days or store.config.max_bytes):
+        background.append(asyncio.create_task(_retention_loop(store)))
+    try:
+        yield
+    finally:
+        for task in background:
+            task.cancel()
+        for task in background:
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if store is not None:
+            await store.close()
+
+
+app = FastAPI(title="OpenManus Web", lifespan=_lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -597,6 +660,14 @@ async def logout(request: Request) -> JSONResponse:
     return response
 
 
+_CSP_VALUE = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+    "connect-src 'self' ws: wss:; font-src 'self'; object-src 'none'; "
+    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+)
+
+
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     """Origin/CSRF check on mutating routes, static-asset auth gate, and
@@ -617,6 +688,17 @@ async def security_middleware(request: Request, call_next):
         # Force revalidation on every load (ETag keeps unchanged assets a
         # cheap 304); pairs with the versioned asset URLs in _app_shell_html.
         response.headers["Cache-Control"] = "no-cache"
+    # SEC-001: baseline browser hardening on every response. CSP permits
+    # inline script/style only because the login page embeds both (see
+    # LOGIN_PAGE_HTML); the app shell's own assets are fully external.
+    # img-src data: covers the agent browser screenshots (base64 frames).
+    for name, value in (
+        ("X-Content-Type-Options", "nosniff"),
+        ("X-Frame-Options", "DENY"),
+        ("Referrer-Policy", "same-origin"),
+        ("Content-Security-Policy", _CSP_VALUE),
+    ):
+        response.headers.setdefault(name, value)
     identity = getattr(request.state, "identity", None) or "-"
     _log_access(request, identity, response.status_code)
     return response
@@ -666,8 +748,10 @@ async def root(request: Request) -> Response:
 
 @app.get("/api/health")
 async def health() -> Dict[str, str]:
-    """Liveness probe."""
-    return {"status": "ok", "service": "OpenManus Web"}
+    """Liveness probe. Deliberately anonymous (monitoring) but minimal —
+    no service-name disclosure (SEC-002): the one public route should not
+    fingerprint the app when the console is exposed via a tunnel."""
+    return {"status": "ok"}
 
 
 def _safe_workspace_path(raw: str) -> Optional[Path]:
@@ -989,49 +1073,382 @@ def _gdrive_reset() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Session history: list and delete past conversations (in-memory, per process)
+# Session history: disk-backed runs plus their current live-process state
 # ---------------------------------------------------------------------------
+def _store() -> SessionStore:
+    """Return the run-history store or answer 503 when it is not available."""
+    if SESSION_STORE is None:
+        raise HTTPException(status_code=503, detail="Run history is not available")
+    return SESSION_STORE
+
+
+def _history_message(state: str) -> dict[str, Any]:
+    """Payload for history_degraded / history_recovered client events."""
+    text = (
+        "Run history is not being saved right now. Runs continue; the portal is retrying."
+        if state == "degraded"
+        else "Run history saving has recovered."
+    )
+    return {"message": text, "ts": int(time.time() * 1000)}
+
+
+async def _broadcast_history_state(state: str) -> None:
+    """Tell every connected client that history saving degraded or recovered."""
+    payload = {"type": f"history_{state}", "data": _history_message(state)}
+    for session in list(sessions.values()):
+        await session._send_raw(payload)
+    if state == "recovered":
+        await _flush_pending_finishes()
+
+
+def _on_history_state(state: str) -> None:
+    """SessionStore callback (event-loop thread): fan the state out to clients."""
+    logger.warning(f"Run history {state}")
+    task = asyncio.get_running_loop().create_task(_broadcast_history_state(state))
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+
+
+def _remember_pending_finish(kwargs: dict[str, Any]) -> None:
+    """Keep a run completion that could not be saved, bounded in size."""
+    PENDING_FINISHES.append(kwargs)
+    del PENDING_FINISHES[: max(0, len(PENDING_FINISHES) - PENDING_FINISH_MAX)]
+
+
+async def _flush_pending_finishes() -> None:
+    """Retry remembered run completions after the disk recovers."""
+    store = SESSION_STORE
+    while PENDING_FINISHES and store is not None:
+        try:
+            await store.finish_run(**PENDING_FINISHES[0])
+        except StoreIOError:
+            return
+        except SessionStoreError as exc:
+            logger.warning(f"Dropping unsaveable run completion ({type(exc).__name__})")
+        PENDING_FINISHES.pop(0)
+
+
+def _session_api_item(summary: dict[str, Any]) -> dict[str, Any]:
+    """Merge one indexed session summary with its optional live state."""
+    live = sessions.get(summary["id"])
+    read_only = live is None or live.read_only
+    return {
+        **summary,
+        "running": bool(live and live.is_running),
+        "historical": read_only,
+        "read_only": read_only,
+    }
+
+
 @app.get("/api/sessions")
 async def list_sessions(username: str = Depends(require_auth)) -> JSONResponse:
-    """List chat sessions that ran at least one task.
+    """List persisted chat sessions that ran at least one task.
 
-    Bare reconnects (page loads without a run) also create session objects;
-    they are skipped so the history shows only real conversations.
+    Bare reconnects are not written to the store and remain excluded. Summaries
+    come from the in-memory index (no disk scan) merged with live state.
     """
     items = [
-        {
-            "id": sid,
-            "title": s.title,
-            "created_at": s.created_at,
-            "last_active": s.last_active,
-            "running": s.is_running,
-        }
-        for sid, s in sessions.items()
-        if s.title
+        _session_api_item(summary)
+        for summary in _store().list_session_summaries()
+        if summary.get("title")
     ]
-    items.sort(key=lambda x: x["last_active"], reverse=True)
     return JSONResponse({"sessions": items})
+
+
+@app.get("/api/runs")
+async def list_runs(
+    limit: int = Query(50, ge=1),
+    cursor: str | None = Query(None, max_length=200),
+    status: str | None = Query(None, max_length=20),
+    q: str | None = Query(None, max_length=200),
+    since: float | None = Query(None),
+    until: float | None = Query(None),
+    sort: str = Query("newest", max_length=20),
+    username: str = Depends(require_auth),
+) -> JSONResponse:
+    """List persisted runs with filtering, sorting, search, and cursor paging.
+
+    Args:
+        limit: Page size (capped by WEBAPP_RUNS_PAGE_MAX).
+        cursor: Opaque ``next_cursor`` from the previous page.
+        status: Only runs with this status.
+        q: Case-insensitive search over title, prompt, and final response.
+        since: Only runs started at or after this Unix time.
+        until: Only runs started at or before this Unix time.
+        sort: ``newest``, ``oldest``, ``duration``, or ``tokens``.
+
+    Returns:
+        ``runs`` (previews only), ``next_cursor``, a ``summary`` covering every
+        match, and ``total_all``. Full text comes from the detail endpoint.
+    """
+    try:
+        result = _store().query_runs(
+            limit=min(limit, RUNS_PAGE_MAX),
+            cursor=cursor,
+            status=status,
+            q=q,
+            since=since,
+            until=until,
+            sort=sort,
+        )
+    except SessionStoreError as exc:
+        raise HTTPException(status_code=400, detail="Invalid run query") from exc
+    items = []
+    for run in result["runs"]:
+        live = sessions.get(run["session_id"])
+        running = bool(live and live.is_running and live._current_run_id == run["id"])
+        item = {**run, "running": running, "read_only": not running}
+        if item["status"] == "running" and not running:
+            item["status"] = "interrupted"
+        items.append(item)
+    return JSONResponse({**result, "runs": items})
+
+
+@app.get("/api/runs/{session_id}/{run_id}")
+async def get_run_history(
+    session_id: str,
+    run_id: str,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(500, ge=1),
+    types: str | None = Query(None, max_length=300),
+    username: str = Depends(require_auth),
+) -> JSONResponse:
+    """Return one full run record and a page of its persisted events.
+
+    Args:
+        offset: Matching events to skip.
+        limit: Events per page (capped by WEBAPP_EVENTS_PAGE_MAX).
+        types: Optional comma-separated event types to keep.
+
+    Returns:
+        The run, one page of events (screenshots as ``image_ref`` blob names,
+        never inline), and ``total_events`` matching the filter.
+    """
+    store = _store()
+    if not (store.is_valid_id(session_id) and store.is_valid_id(run_id)):
+        raise HTTPException(status_code=404, detail="Run not found")
+    type_set = [item for item in (types or "").split(",") if item.strip()] or None
+    try:
+        run = await asyncio.to_thread(store.get_run, session_id, run_id)
+        if run is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        events, total = await store.read_event_page(
+            session_id,
+            run_id,
+            offset=offset,
+            limit=min(limit, EVENTS_PAGE_MAX),
+            types=type_set,
+        )
+    except SessionStoreError as exc:
+        raise HTTPException(status_code=409, detail="Stored run history is unreadable") from exc
+    live = sessions.get(session_id)
+    running = bool(live and live.is_running and live._current_run_id == run_id)
+    if run.get("status") == "running" and not running:
+        run["status"] = "interrupted"
+    run.update({"running": running, "read_only": not running})
+    return JSONResponse(
+        {
+            "run": run,
+            "events": events,
+            "total_events": total,
+            "offset": offset,
+            "limit": min(limit, EVENTS_PAGE_MAX),
+            "read_only": not running,
+        }
+    )
+
+
+_BLOB_MEDIA_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+@app.get("/api/blobs/{session_id}/{name}")
+async def get_blob(
+    session_id: str, name: str, username: str = Depends(require_auth)
+) -> FileResponse:
+    """Serve one offloaded screenshot (authenticated, path-confined)."""
+    store = _store()
+    if not store.is_valid_id(session_id):
+        raise HTTPException(status_code=404, detail="Not found")
+    path = store.blob_path(session_id, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Not found")
+    return FileResponse(
+        str(path),
+        media_type=_BLOB_MEDIA_TYPES.get(path.suffix, "application/octet-stream"),
+        headers={"Cache-Control": "private, max-age=86400"},
+    )
+
+
+class PrunePayload(BaseModel):
+    """Validated body for manual history pruning."""
+
+    older_than_days: float = Field(..., gt=0, le=36500)
+
+
+def _protected_session_ids() -> set:
+    """Session ids that currently have a run in flight."""
+    return {
+        sid
+        for sid, session in sessions.items()
+        if session.is_running or session._current_run_id is not None
+    }
+
+
+def _drop_orphan_restored_sessions(store: SessionStore) -> None:
+    """Forget read-only session handles whose history was pruned."""
+    alive = {item["id"] for item in store.list_session_summaries()}
+    for sid, session in list(sessions.items()):
+        if sid not in alive and session.read_only and session.websocket is None:
+            sessions.pop(sid, None)
+
+
+@app.post("/api/history/prune")
+async def prune_history(
+    payload: PrunePayload, username: str = Depends(require_auth)
+) -> JSONResponse:
+    """Delete sessions inactive for longer than ``older_than_days``.
+
+    Sessions with a run in flight are never deleted. Only counts are returned.
+    """
+    store = _store()
+    try:
+        result = await store.prune(
+            older_than_days=payload.older_than_days, protected=_protected_session_ids()
+        )
+    except SessionStoreError as exc:
+        raise HTTPException(status_code=409, detail="History pruning failed") from exc
+    _drop_orphan_restored_sessions(store)
+    logger.info(
+        f"history pruned by {username}: {result['deleted_sessions']} session(s), "
+        f"{result['freed_bytes']} bytes"
+    )
+    return JSONResponse(result)
+
+
+@app.get("/api/health/detail")
+async def health_detail(username: str = Depends(require_auth)) -> JSONResponse:
+    """Per-component health with a timestamp (authenticated; no error details)."""
+    store = SESSION_STORE
+    if store is None:
+        component: dict[str, Any] = {
+            "status": "unhealthy",
+            "initialised": False,
+            "last_error_class": HISTORY_INIT_ERROR,
+        }
+    else:
+        component = {**store.health(), "initialised": True}
+    return JSONResponse(
+        {
+            "status": component["status"],
+            "timestamp": time.time(),
+            "components": {"session_store": component},
+        }
+    )
+
+
+async def _retention_loop(store: SessionStore) -> None:
+    """Periodically prune history by the configured age and size limits."""
+    config = store.config
+    while True:
+        try:
+            result = await store.prune(
+                older_than_days=config.max_age_days,
+                max_bytes=config.max_bytes,
+                protected=_protected_session_ids(),
+            )
+            if result["deleted_sessions"]:
+                _drop_orphan_restored_sessions(store)
+                logger.info(
+                    f"retention pruned {result['deleted_sessions']} session(s), "
+                    f"{result['freed_bytes']} bytes"
+                )
+        except SessionStoreError as exc:
+            logger.warning(f"retention pass failed ({type(exc).__name__})")
+        await asyncio.sleep(config.prune_interval_minutes * 60)
 
 
 @app.delete("/api/sessions/{session_id}")
 async def delete_session(session_id: str, username: str = Depends(require_auth)) -> JSONResponse:
-    """Delete a session: stop a running agent, free its resources, drop history."""
-    session = sessions.get(session_id)
-    if session is None:
+    """Stop a live session if needed and delete its memory and disk history."""
+    store = _store()
+    if not store.is_valid_id(session_id):
         raise HTTPException(status_code=404, detail="Session not found")
-    if session._task and not session._task.done():
-        session._task.cancel()
-    agent = session.agent
-    if agent is not None:
-        async def _cleanup() -> None:
-            try:
-                await agent.cleanup()
-            except Exception:
-                pass
+    session = sessions.get(session_id)
+    try:
+        stored = await asyncio.to_thread(store.get_session, session_id)
+    except SessionStoreError as exc:
+        raise HTTPException(status_code=409, detail="Stored session history is unreadable") from exc
+    if session is None and stored is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session is not None:
+        session._deleted = True
+        if session._task and not session._task.done():
+            session._task.cancel()
+        agent = session.agent
+        if agent is not None:
+            async def _cleanup() -> None:
+                try:
+                    await agent.cleanup()
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown of a deleted session
+                    logger.warning(f"Deleted-session agent cleanup failed ({type(exc).__name__})")
 
-        asyncio.create_task(_cleanup())
-    del sessions[session_id]
+            asyncio.create_task(_cleanup())
+    await store.delete_session(session_id)
+    sessions.pop(session_id, None)
     return JSONResponse({"status": "ok"})
+
+
+async def _evict_idle_sessions(ttl_seconds: float, now: float | None = None) -> int:
+    """Release agents (and their MCP processes) of long-idle sessions.
+
+    A session is idle when it has no running task and no connected client for
+    ``ttl_seconds``. Evicted sessions keep their history but become read-only.
+
+    Args:
+        ttl_seconds: Idle time required before eviction.
+        now: Monotonic timestamp override (tests).
+
+    Returns:
+        The number of sessions evicted.
+    """
+    moment = time.monotonic() if now is None else now
+    evicted = 0
+    for session in list(sessions.values()):
+        if (
+            session.agent is None
+            or session.is_running
+            or session.websocket is not None
+            or session._deleted
+            or session.read_only
+            or (session._task is not None and not session._task.done())
+            or moment - session._idle_since < ttl_seconds
+        ):
+            continue
+        agent = session.agent
+        session.agent = None
+        session.read_only = True
+        session.evicted = True
+        session._events_loaded = True
+        try:
+            await agent.cleanup()
+        except Exception as exc:  # noqa: BLE001 - one bad agent must not stop the sweep
+            logger.warning(f"Idle agent cleanup failed ({type(exc).__name__})")
+        evicted += 1
+    return evicted
+
+
+async def _idle_eviction_loop() -> None:
+    """Sweep for idle agents on a fixed interval."""
+    while True:
+        await asyncio.sleep(AGENT_IDLE_CHECK_SECONDS)
+        count = await _evict_idle_sessions(AGENT_IDLE_MINUTES * 60)
+        if count:
+            logger.info(f"Evicted {count} idle agent session(s)")
 
 
 # ---------------------------------------------------------------------------
@@ -1042,7 +1459,13 @@ async def delete_session(session_id: str, username: str = Depends(require_auth))
 # is inside the gitignored workspace dir, so API keys never enter source
 # control. Keys are never returned in full over the API and never logged.
 # ---------------------------------------------------------------------------
-MODELS_FILE = Path(__file__).parent / "webapp_models.json"
+MODELS_FILE = Path(
+    # Env-overridable per §2.1 — the test suites redirect this to a temp file
+    # so model-switch tests never touch the operator's real registry (found
+    # 2026-09-28: test_model_switch_broadcasts_control_event reset the live
+    # `active` model to builtin:default).
+    os.environ.get("WEBAPP_MODELS_FILE", Path(__file__).parent / "webapp_models.json")
+)
 
 PROVIDER_PRESETS: List[Dict[str, str]] = [
     {"label": "OpenAI", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
@@ -1687,17 +2110,25 @@ def _tool_category(name: str) -> str:
 
 
 class AgentSession:
-    """One chat session: a persistent Manus agent plus a WebSocket client.
+    """One chat session with a live agent or read-only persisted history.
 
-    The agent is created lazily on first prompt and reused for subsequent
-    prompts, so the conversation (memory) survives across turns. think(),
-    step() and execute_tool() are wrapped to emit UI events.
+    Live agents are created lazily and reused across turns. Every run and event
+    is also written to SESSION_STORE; restored sessions replay that history but
+    reject new runs because agent execution state is intentionally not restored.
     """
 
     def __init__(self) -> None:
         self.agent: Optional[Manus] = None
         self.websocket: Optional[WebSocket] = None
+        self.session_id = ""
         self.is_running = False
+        self.read_only = False
+        self.evicted = False
+        self._idle_since = time.monotonic()  # last run end or client disconnect
+        self._runs_total: int | None = None  # restored-session replay window
+        self._runs_shown: int | None = None
+        self._events_loaded = True
+        self._deleted = False
         self._task: Optional[asyncio.Task] = None
         self._human_future: Optional[asyncio.Future] = None
         self.event_log: List[Dict[str, Any]] = []
@@ -1710,6 +2141,40 @@ class AgentSession:
         self._first_prompt: str = ""     # full first prompt (journal body)
         self._journal_path_cached: Optional[Path] = None
         self._run_files_start: set = set()  # touched_files snapshot at run start
+        self._current_run_id: Optional[str] = None
+        self._run_persisted = False
+        self._stop_requested = False
+        self._run_steps = 0
+        self._run_actions = 0
+        self._run_input_tokens = 0
+        self._run_output_tokens = 0
+
+    @classmethod
+    def from_persisted(cls, record: Dict[str, Any]) -> "AgentSession":
+        """Build a read-only session handle from persisted metadata.
+
+        Args:
+            record: Session metadata loaded from SESSION_STORE.
+
+        Returns:
+            A session with no agent whose events load lazily on connection.
+
+        Example:
+            >>> restored = AgentSession.from_persisted({"id": "s1", "runs": []})
+            >>> restored.read_only
+            True
+        """
+        session = cls()
+        session.session_id = str(record["id"])
+        session.title = str(record.get("title") or "Task")
+        session.created_at = int(record.get("created_at") or 0)
+        session.last_active = int(record.get("last_active") or 0)
+        runs = record.get("runs") or []
+        if runs and isinstance(runs[0], dict):
+            session._first_prompt = str(runs[0].get("prompt") or "")
+        session.read_only = True
+        session._events_loaded = False
+        return session
 
     def journal_path(self) -> Path:
         """Stable per-task .md path in the Obsidian vault (computed once)."""
@@ -1722,9 +2187,33 @@ class AgentSession:
 
     # -- websocket plumbing -------------------------------------------------
     async def connect(self, websocket: WebSocket) -> None:
-        """Accept the client socket and replay this session's event history."""
+        """Accept the socket, lazily restore history, and replay whole runs.
+
+        Restored sessions replay the newest runs that fit within MAX_EVENT_LOG
+        (never a mid-run cut) and report how many runs are shown out of the
+        total, so earlier runs are never dropped silently.
+
+        Raises:
+            SessionStoreError: If persisted history cannot be read.
+        """
         await websocket.accept()
         self.websocket = websocket
+        store = SESSION_STORE
+        if self.read_only:
+            if not self._events_loaded and store is not None:
+                events, self._runs_total, self._runs_shown = await store.recent_run_events(
+                    self.session_id, MAX_EVENT_LOG
+                )
+                self.event_log = events
+                self._events_loaded = True
+            info: dict[str, Any] = {"read_only": True, "evicted": self.evicted}
+            if self._runs_total is not None:
+                info.update(runs_total=self._runs_total, runs_shown=self._runs_shown)
+            await self._send_raw({"type": "session_info", "data": info})
+        if store is not None and store.degraded:
+            await self._send_raw(
+                {"type": "history_degraded", "data": _history_message("degraded")}
+            )
         if self.event_log:
             await self._send_raw({"type": "replay", "data": {"events": self.event_log}})
 
@@ -1736,6 +2225,7 @@ class AgentSession:
             except Exception:
                 pass
         self.websocket = None
+        self._idle_since = time.monotonic()
 
     async def _send_raw(self, payload: Dict[str, Any]) -> None:
         if self.websocket is None:
@@ -1746,17 +2236,44 @@ class AgentSession:
             self.websocket = None
 
     async def send_event(self, event_type: str, data: Dict[str, Any]) -> None:
-        """Push an event to the client and append it to the replay log.
+        """Push an event and queue it for disk, independent of the RAM replay cap.
 
         Args:
             event_type: Event discriminator (e.g. "tool_start", "thought").
-            data: Event payload consumed by the frontend.
+            data: Event payload consumed by the frontend. A server-side
+                `ts` (epoch ms) is merged in so the UI can render true
+                run-relative durations on both live and replayed runs
+                (UX-002: replayed timelines used to show 0:00 everywhere).
+
+        Note:
+            Persistence is a non-blocking enqueue that can never fail the run;
+            disk problems degrade history and are surfaced via history_*
+            events instead. Only events inside a run are persisted.
         """
-        event = {"type": event_type, "data": data}
-        self.event_log.append(event)
-        if len(self.event_log) > MAX_EVENT_LOG:
-            del self.event_log[: len(self.event_log) - MAX_EVENT_LOG]
+        event = {"type": event_type, "data": {**data, "ts": int(time.time() * 1000)}}
+        if event_type == "step":
+            self._run_steps += 1
+        elif event_type == "tool_start":
+            self._run_actions += 1
+        elif event_type == "usage":
+            self._run_input_tokens += max(0, int(data.get("delta_in") or 0))
+            self._run_output_tokens += max(0, int(data.get("delta_out") or 0))
+        if not self.read_only:
+            self.event_log.append(event)
+            if len(self.event_log) > MAX_EVENT_LOG:
+                del self.event_log[: len(self.event_log) - MAX_EVENT_LOG]
+            self._persist_event(event)
         await self._send_raw(event)
+
+    def _persist_event(self, event: dict[str, Any]) -> None:
+        """Queue an in-run event for the disk store (never raises)."""
+        store = SESSION_STORE
+        if store is None or self._deleted or self._current_run_id is None:
+            return
+        try:
+            store.enqueue_event(self.session_id, self._current_run_id, event)
+        except SessionStoreError as exc:
+            logger.warning(f"Event not persisted ({type(exc).__name__})")
 
     # -- agent lifecycle ----------------------------------------------------
     async def _ensure_agent(self) -> Manus:
@@ -1955,12 +2472,23 @@ class AgentSession:
 
     # -- run loop -----------------------------------------------------------
     async def run_agent(self, prompt: str) -> None:
-        """Run one turn of the agent, streaming progress to the client.
+        """Run one turn and persist its metadata and complete event stream.
 
         Args:
             prompt: The user's request for this turn.
+
+        Raises:
+            SessionStoreError: If final run metadata cannot be persisted after
+                the run itself has finished.
         """
+        if self._deleted or self.read_only:
+            await self.send_event(
+                "error",
+                {"message": "This session is deleted or read-only and cannot accept runs."},
+            )
+            return
         self.is_running = True
+        self._stop_requested = False
         self._started_at = time.monotonic()
         now = int(time.time())
         self.last_active = now
@@ -1969,12 +2497,37 @@ class AgentSession:
             self.title = prompt.strip().split("\n")[0][:80]
         if not self._first_prompt:
             self._first_prompt = prompt.strip()
+        run_id = secrets.token_hex(8)
+        run_title = prompt.strip().split("\n")[0][:80]
+        self._current_run_id = run_id
+        self._run_persisted = False
+        self._run_steps = 0
+        self._run_actions = 0
+        self._run_input_tokens = 0
+        self._run_output_tokens = 0
         self._run_files_start = set(self.touched_files)
         run_status, run_final = "running", ""
-        _write_task_journal(self, run_status)
+        store = SESSION_STORE
+        if store is not None:
+            # A disk problem must never fail a healthy run: if the start record
+            # cannot be saved, the run proceeds and is recorded at completion.
+            try:
+                await store.create_run(self.session_id, run_id, run_title, prompt.strip(), now)
+                self._run_persisted = True
+            except SessionStoreError as exc:
+                logger.warning(f"Run start not persisted ({type(exc).__name__}); will retry")
         try:
+            _write_task_journal(self, run_status)
+            # UX-001: emit run_start BEFORE agent/MCP initialization (the
+            # cascade can take a minute with many MCP servers) so the client
+            # immediately shows the run as accepted — bubble, Working pill,
+            # Stop button — instead of a dead-silent idle UI. Failure during
+            # _ensure_agent now surfaces as a proper failed run, not silence.
+            await self.send_event(
+                "run_start",
+                {"prompt": prompt, "max_steps": MAX_STEPS, "run_id": self._current_run_id},
+            )
             agent = await self._ensure_agent()
-            await self.send_event("run_start", {"prompt": prompt, "max_steps": agent.max_steps})
             await agent.run(prompt)
             final = next(
                 (
@@ -1983,7 +2536,7 @@ class AgentSession:
                     if m.role == "assistant" and m.content
                 ),
                 "",
-            )
+            ) or ""
             run_status, run_final = "completed", final
             await self.send_event("final_result", {"content": final})
         except asyncio.CancelledError:
@@ -2008,10 +2561,39 @@ class AgentSession:
             )
             copied = _export_task_outputs(self, new_files)
             _write_task_journal(self, run_status, run_final, tuple(copied))
+            if store is not None and not self._deleted:
+                completion: dict[str, Any] = {
+                    "session_id": self.session_id,
+                    "run_id": run_id,
+                    "status": run_status,
+                    "ended_at": self.last_active,
+                    "final_response": run_final,
+                    "files": sorted(new_files),
+                    "steps": self._run_steps,
+                    "actions": self._run_actions,
+                    "input_tokens": self._run_input_tokens,
+                    "output_tokens": self._run_output_tokens,
+                    # Lets the store create the run here if its start was lost.
+                    "title": run_title,
+                    "prompt": prompt.strip(),
+                    "started_at": now,
+                }
+                try:
+                    await store.finish_run(**completion)
+                except StoreIOError:
+                    _remember_pending_finish(completion)
+                except SessionStoreError as exc:
+                    logger.warning(f"Run completion not persisted ({type(exc).__name__})")
             await self.send_event("run_end", {})
+            self._current_run_id = None
+            self._run_persisted = False
+            self._idle_since = time.monotonic()
 
     async def stop(self) -> None:
-        """Cancel the in-flight run; agent memory is kept for the next turn."""
+        """Request one cancellation without interrupting run finalization."""
+        if not self.is_running or self._stop_requested:
+            return
+        self._stop_requested = True
         if self._task and not self._task.done():
             self._task.cancel()
 
@@ -2038,8 +2620,23 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
         await websocket.close(code=1008)
         return
 
-    session = sessions.setdefault(session_id, AgentSession())
-    await session.connect(websocket)
+    session = sessions.get(session_id)
+    if session is None:
+        record = None
+        if SESSION_STORE is not None:
+            try:
+                record = await asyncio.to_thread(SESSION_STORE.get_session, session_id)
+            except SessionStoreError:
+                await websocket.close(code=1008)
+                return
+        session = AgentSession.from_persisted(record) if record else AgentSession()
+        session.session_id = session_id
+        sessions[session_id] = session
+    try:
+        await session.connect(websocket)
+    except SessionStoreError:
+        await session.disconnect()
+        return
     try:
         while True:
             data = await websocket.receive_text()
@@ -2060,6 +2657,15 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str) -> None:
                 prompt = (message.get("prompt") or "").strip()
                 if not prompt:
                     await session.send_event("error", {"message": "Prompt cannot be empty"})
+                elif session._deleted:
+                    await session.send_event(
+                        "error", {"message": "This session was deleted and cannot accept runs."}
+                    )
+                elif session.read_only:
+                    await session.send_event(
+                        "error",
+                        {"message": "Historical sessions are read-only. Start a new task to run the agent."},
+                    )
                 elif session.is_running or (session._task and not session._task.done()):
                     await session.send_event("error", {"message": "Agent is already running"})
                 else:

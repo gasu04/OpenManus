@@ -16,19 +16,22 @@ Browser (vanilla JS, no framework, no build step)
     ├── state             single mutable store (session, ws, running, tab, caches)
     ├── connect()         WS client, auto-reconnect (fixed 2s)    [FIXED → backoff+banner]
     ├── HANDLERS          server-event → DOM mutation (single source of truth: events)
-    ├── tabs / panes      Live, Browser, Terminal, Editor, Files
+    ├── tabs / panes      Live, Browser, Terminal, Editor, Files, Previous Runs
     ├── model modal       fetch /api/models* (CRUD + activate)
-    ├── history drawer    fetch /api/sessions (switch = WS reconnect + replay)
+    ├── Previous Runs tab fetch /api/runs (server-side filter/sort/search/paging), run detail + replay mode
     └── outputs/editor    fetch /api/outputs, /api/files, /api/file, /api/download
 
 Server (FastAPI, single module)
 ├── HTTP (basic-auth)     /  /static  /api/health  /api/files  /api/file
 │                         /api/outputs  /api/download  /api/gdrive/*
-│                         /api/models*  /api/sessions*
+│                         /api/models*  /api/sessions*  /api/runs*  /api/blobs*
+│                         /api/history/prune  /api/health/detail
 ├── WS /ws/{session_id}  client: run|stop|human_reply|ping
 │                         server: replay + 15 event types (see webapp.py)
-├── sessions dict         in-memory: AgentSession{agent, ws, event_log≤2000,
-│                         touched_files, title, created/last_active}
+├── sessions dict         live/restored AgentSession{agent, ws, event_log≤2000,
+│                         touched_files, title, created/last_active, read_only}
+├── SessionStore          disk: session.json + events.jsonl + blobs/ per session,
+│                         derived index.json, writer queue, breaker, retention
 └── instrumentation       wraps agent.think/step/execute_tool as instance attrs
                           → emits events; no core-code changes
 
@@ -66,7 +69,7 @@ found further concrete, reproducible gaps — not polish.
 | P1-8 | P1 | Tool calls in the Live timeline show one truncated, one-line string — the mandated "structured view... Collapsible JSON viewer, not a dumped blob of text" (§2) didn't exist, even though the server already sends the full result in `tool_end` | frontend discarded `ev.result`/`ev.arguments` entirely after rendering the one-line summary | expandable per-call inspector: tool name, status+duration, pretty-printed arguments JSON, result (with server-truncation notice), each field copyable; memory-bounded via the same pruning that already bounds the timeline | test_ui_dom.py (expand/collapse, structured content asserted) |
 | P1-9 | P1 | No copy-to-clipboard anywhere, despite §6 mandating it "on every ID, error message, and code block" | never implemented | `copyToClipboard()` + reusable copy button wired into: tool-inspector fields (call id/args/result), error banners, terminal code blocks, the final answer | test_ui_dom.py (clipboard content asserted after click) |
 | P1-10 | P1 | A failed or stopped run offers no next step — §2 requires "a retry/resume action if applicable" for every failure | no retry path existed (pause/resume/re-run-from-step remain a genuine backend gap, but plain retry doesn't) | run report gets a "Retry" button when the outcome is failed/stopped; resends the exact original prompt through the same guarded `composerDecision` path used by the composer | test_ui_dom.py (click → real round-trip → new chat bubble with the retried prompt) |
-| P2-4 | P2 | Task history has no way to find an old run by name once there are more than a handful | no filter | client-side substring filter on the history drawer (title match over what's already loaded) | test_ui_dom.py |
+| P2-4 | P2 | Task history has no way to find an old run by name once there are more than a handful | no filter | server-side search/filter/sort on the Previous Runs tab (originally a client-side drawer filter) | test_ui_dom.py |
 | P2-5 | P2 | Long timelines have no way to jump to a specific step/tool by name | no filter | client-side substring filter on the Live timeline | test_ui_dom.py |
 | P2-6 | P2 | Final markdown answers can't be viewed as raw text or copied whole — §2 requires a "raw/rendered toggle" | not implemented | toolbar on every final answer: "View raw" toggle (rendered ⇄ raw `<pre>`) + copy button | covered by P1-9's copy-button test pattern; toggle exercised manually |
 
@@ -97,19 +100,22 @@ Filled in as fixes land; see §2 Fix column and git history on feat/manus-web-ui
 
 ## 5. Known Remaining Issues (explicitly deferred, with constraints)
 
-1. **Virtualized 10k+ run list** — no persistence layer (sessions are in-memory,
-   dozens per day on a local tool); true virtualization needs a framework.
-   Mitigation: bounded buffers (P1-2). Constraint: no-rewrite mandate.
+1. **Virtualized 10k+ run list** — runs persist on disk and the list is now
+   index-backed, server-paged ("Load more"), filtered, sorted and searched, so
+   the browser never holds the whole history. Rows are still plain DOM nodes
+   (no windowing), which is fine for thousands of loaded rows but not for
+   scrolling through all of 10k+ in one view. Constraint: no-rewrite mandate.
 2. **Pause / resume / retry / re-run-from-step** — *backend contract gap*: the
    OpenManus agent loop supports cancel only (upstream `BaseAgent.run`). Flagged
-   per §4 rather than faked client-side.
-3. **Diff/compare runs** — requires persisted, versioned artifacts server-side;
-   not present. Deferred.
-4. **Global search across runs/logs/outputs** — needs a server-side index
-   across persisted runs; still deferred. *Partial mitigation shipped:*
-   client-side substring filters on the history drawer and the live timeline
-   (Round 2, P2-4/P2-5) cover what's already loaded in the browser — not a
-   substitute for indexed search across everything ever run.
+   per §4 rather than faked client-side. *Partial mitigation shipped:*
+   "Re-run this prompt" and "Continue from this run" start a **new** session
+   seeded with text; the original agent's state is not restored.
+3. **Diff/compare runs** — runs are now persisted and addressable, but no
+   side-by-side comparison view exists yet. Deferred.
+4. **Global search across logs/outputs** — run search is now server-side over
+   titles, prompts and final answers (`/api/runs?q=`); it does not search tool
+   output, events, or produced-file contents. The Live timeline filter remains
+   client-side over what is rendered.
 5. **Monitoring sink (Sentry et al.)** — local deployment has no monitoring
    infrastructure. *Partial mitigation shipped:* a global `window.onerror` /
    `unhandledrejection` handler (Round 2, P0-3) now tags and logs every

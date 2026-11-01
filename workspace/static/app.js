@@ -11,6 +11,8 @@
     sessionId: sessionStorage.getItem("openmanus_sid") || crypto.randomUUID(),
     running: false,
     replaying: false,
+    readOnly: false,
+    replayMode: null,     // {sessionId, runId} while a historical run is replayed
     pinnedTab: false,
     activeTab: "live",
     step: { current: 0, max: 0 },
@@ -155,6 +157,19 @@
   const fmtTime = () => {
     const s = state.startedAt ? Math.floor((Date.now() - state.startedAt) / 1000) : 0;
     return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+  };
+
+  // UX-002: render a timeline timestamp from the event's own server-side
+  // `ts` (epoch ms, embedded by the backend since the duration fix) relative
+  // to the run's start, so replayed runs show real durations instead of the
+  // client-side live timer's 0:00. Falls back to the live timer for events
+  // that predate ts instrumentation.
+  const fmtEventTime = (ev) => {
+    if (ev && ev.ts && state.startedAt) {
+      const s = Math.max(0, Math.floor((ev.ts - state.startedAt) / 1000));
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+    }
+    return fmtTime();
   };
 
   const icon = (name) => `<svg class="ic"><use href="#${name}"/></svg>`;
@@ -393,13 +408,13 @@
     scrollDown(messages);
   }
 
-  function finalizeActivityPill(done) {
+  function finalizeActivityPill(done, ev) {
     const pill = state.activityPill;
     if (!pill) return;
     pill.classList.add("done");
     pill.querySelector(".ap-status").innerHTML = done ? icon("i-check") : icon("i-stop");
     pill.querySelector(".ap-count").textContent =
-      `${state.actionCount} actions · ${fmtTime()} · view details`;
+      `${state.actionCount} actions · ${fmtEventTime(ev)} · view details`;
   }
 
   // -------------------------------------------------------- timeline
@@ -417,7 +432,7 @@
         <div class="tl-title">${esc(ui.label)}</div>
         <div class="tl-detail">${esc(toolDetail(ev.name, ev.arguments))}</div>
       </div>
-      <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>
+      <div class="tl-time" title="${esc(absoluteTime(ev.ts || Date.now()))}">${fmtEventTime(ev)}</div>
       <div class="tl-status"><span class="spinner"></span></div>
       <button class="tl-expand" aria-expanded="false" aria-label="Show tool call details">${icon("i-chevron")}</button>`;
     el.querySelector(".tl-expand").onclick = () => toggleToolInspector(el);
@@ -477,18 +492,20 @@
   }
 
   // End-of-run report entry in the Live timeline (success / stopped / failed).
-  function addRunReport() {
+  // `ev` is the run_end event — its server ts makes the duration replay-safe.
+  function addRunReport(ev) {
     if (timeline.querySelector(".pane-empty")) timeline.innerHTML = "";
     const outcome = state.runOutcome || "ended";
+    const dur = fmtEventTime(ev);
     const tok = state.runTokens.in + state.runTokens.out > 0
       ? ` · ${(state.runTokens.in + state.runTokens.out).toLocaleString()} tokens` : "";
     const report = {
-      completed: { title: "Task completed", detail: `${state.actionCount} actions · ${state.step.current} steps · ${fmtTime()}${tok}`, cls: "ok", ic: "i-check" },
-      stopped: { title: "Task stopped by user", detail: `${state.actionCount} actions before stopping · ${fmtTime()}${tok}`, cls: "stopped", ic: "i-stop" },
-      failed: { title: "Task failed", detail: `Error during run · ${state.actionCount} actions · ${fmtTime()}`, cls: "err", ic: "i-x" },
-      ended: { title: "Run ended", detail: `${state.actionCount} actions · ${fmtTime()}${tok}`, cls: "", ic: "i-bolt" },
+      completed: { title: "Task completed", detail: `${state.actionCount} actions · ${state.step.current} steps · ${dur}${tok}`, cls: "ok", ic: "i-check" },
+      stopped: { title: "Task stopped by user", detail: `${state.actionCount} actions before stopping · ${dur}${tok}`, cls: "stopped", ic: "i-stop" },
+      failed: { title: "Task failed", detail: `Error during run · ${state.actionCount} actions · ${dur}`, cls: "err", ic: "i-x" },
+      ended: { title: "Run ended", detail: `${state.actionCount} actions · ${dur}${tok}`, cls: "", ic: "i-bolt" },
     }[outcome];
-    const canRetry = (outcome === "failed" || outcome === "stopped") && state.lastPrompt;
+    const canRetry = !state.readOnly && (outcome === "failed" || outcome === "stopped") && state.lastPrompt;
     const el = document.createElement("div");
     el.className = `tl-item tl-report ${report.cls}`;
     el.innerHTML = `
@@ -499,7 +516,7 @@
         <div class="tl-title">${report.title}</div>
         <div class="tl-detail">${esc(report.detail)}</div>
       </div>
-      <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>
+      <div class="tl-time" title="${esc(absoluteTime((ev && ev.ts) || Date.now()))}">${dur}</div>
       ${canRetry ? `<button class="tl-retry">${icon("i-refresh")} Retry</button>` : ""}`;
     if (canRetry) el.querySelector(".tl-retry").onclick = retryLastRun;
     timeline.appendChild(el);
@@ -544,6 +561,7 @@
     if (tab === "live") scrollDown($("pane-live"));
     if (tab === "editor") refreshFiles();   // always reload on switch
     if (tab === "files") loadOutputs();     // always reload on switch
+    if (tab === "runs") loadRuns(false);   // disk-backed history on every visit
   }
 
   function autoSwitch(cat) {
@@ -566,14 +584,22 @@
     autoSwitch("browser");
   }
 
+  function setScreenshotUrl(url) {
+    const img = $("browserShot");
+    $("browserEmpty")?.classList.add("hidden");
+    img.classList.remove("hidden");
+    img.src = url;
+    autoSwitch("browser");
+  }
+
   // -------------------------------------------------------- terminal pane
-  function addTerminalBlock(code, output) {
+  function addTerminalBlock(code, output, ev) {
     if (terminal.querySelector(".pane-empty")) terminal.innerHTML = "";
     const ok = !/\berror\b|Traceback|Exception/i.test(output || "");
     const el = document.createElement("div");
     el.className = "term-block";
     el.innerHTML = `
-      <div class="term-prompt"><span><span class="term-user">agent</span>@openmanus:~$</span><span>${fmtTime()}</span></div>
+      <div class="term-prompt"><span><span class="term-user">agent</span>@openmanus:~$</span><span>${fmtEventTime(ev)}</span></div>
       <div class="term-code-row"><div class="term-code">${esc(code)}</div>${copyBtnHtml(0, "code")}</div>
       ${output ? `<div class="term-out ${ok ? "" : "err"}">${esc(output)}</div>` : ""}`;
     wireCopyButtons(el, [code]);
@@ -751,74 +777,6 @@
     }
   }
 
-  // -------------------------------------------------------- history drawer
-  const historyDrawer = $("historyDrawer");
-
-  const timeAgo = (ts) => {
-    if (!ts) return "";
-    const s = Math.floor((Date.now() - ts * 1000) / 1000);
-    if (s < 60) return "just now";
-    if (s < 3600) return `${Math.floor(s / 60)}m ago`;
-    if (s < 86400) return `${Math.floor(s / 3600)}h ago`;
-    return `${Math.floor(s / 86400)}d ago`;
-  };
-
-  async function loadHistory() {
-    const list = $("historyList");
-    let data;
-    try {
-      data = await fetchJson("/api/sessions");
-    } catch {
-      list.innerHTML = errorRow("Could not load task history.", "history");
-      bindRetry(list, loadHistory);
-      return;
-    }
-    if (!data.sessions.length) {
-      list.innerHTML = `<div class="pane-empty">No past tasks yet. Send a message to start one.</div>`;
-      return;
-    }
-    list.innerHTML = "";
-    for (const s of data.sessions) {
-      const item = document.createElement("div");
-      item.className = "history-item" + (s.id === state.sessionId ? " current" : "") + (s.running ? " running" : "");
-      item.innerHTML = `
-        <span class="h-dot"></span>
-        <div class="h-body">
-          <div class="h-title" title="${esc(s.title)}">${esc(s.title)}</div>
-          <div class="h-meta">${timeAgo(s.created_at)}${s.running ? " · running" : ""}</div>
-        </div>
-        <button class="h-del" title="Delete" aria-label="Delete this task"><svg class="ic"><use href="#i-trash"/></svg></button>`;
-      item.onclick = () => switchSession(s.id);
-      item.querySelector(".h-del").onclick = async (e) => {
-        e.stopPropagation();
-        if (!confirm("Delete this task and its history? This cannot be undone.")) return;
-        try {
-          await fetchJson(`/api/sessions/${encodeURIComponent(s.id)}`, { method: "DELETE" });
-        } catch {
-          showToast("Could not delete the task — check your connection and try again.", "error");
-          return;
-        }
-        if (s.id === state.sessionId) { resetToNewSession(); return; }
-        loadHistory();
-      };
-      list.appendChild(item);
-    }
-    applyHistoryFilter();
-  }
-
-  // Client-side filter over what's already loaded (P2-4). This is NOT the
-  // mandated global search across runs/logs/outputs — that needs a
-  // server-side index this local, in-memory session store doesn't have.
-  // See UI_ENGAGEMENT.md §5 for the deferral reasoning.
-  function applyHistoryFilter() {
-    const q = $("historySearch").value.trim().toLowerCase();
-    $("historyList").querySelectorAll(".history-item").forEach((item) => {
-      const hay = item.querySelector(".h-title")?.textContent.toLowerCase() || "";
-      item.classList.toggle("hidden", q.length > 0 && !hay.includes(q));
-    });
-  }
-  $("historySearch").addEventListener("input", applyHistoryFilter);
-
   // Live timeline filter (P2-5) — same client-side-only caveat as history
   // search: filters what's already rendered, not a server-side log index.
   $("timelineFilter").addEventListener("input", (e) => {
@@ -828,30 +786,34 @@
     });
   });
 
-  function switchSession(sid) {
-    if (sid === state.sessionId) { closeHistory(); return; }
+  function switchSession(sid, readOnly = false) {
+    if (sid === state.sessionId) return;
+    clearReplayMode();
     state.intentionalClose = true;
     state.ws?.close();
     state.intentionalClose = false;
     state.sessionId = sid;
     sessionStorage.setItem("openmanus_sid", sid);
     history.replaceState(null, "", `#s=${sid}`);
+    setReadOnly(readOnly);
     setRunning(false);
     resetPanes();
     state.files.clear();
     state.outputsDirty = true;
     state.pinnedTab = false;
-    closeHistory();
+    switchTab("live", true);
     connect(); // server replays this session's event log, rebuilding the UI
   }
 
   function resetToNewSession() {
+    clearReplayMode();
     state.intentionalClose = true;
     state.ws?.close();
     state.intentionalClose = false;
     state.sessionId = crypto.randomUUID();
     sessionStorage.setItem("openmanus_sid", state.sessionId);
     history.replaceState(null, "", `#s=${state.sessionId}`);
+    setReadOnly(false);
     setRunning(false);
     resetPanes();
     state.files.clear();
@@ -862,24 +824,467 @@
         <h1>Hi, I'm OpenManus.</h1>
         <p>What can I do for you? I can browse the web, run code, and edit files — you'll see every step live in the panel on the right.</p>
       </div>`;
-    closeHistory();
     connect();
   }
 
-  function openHistory() {
-    historyDrawer.classList.remove("hidden");
-    $("historyList").innerHTML = `<div class="pane-empty">Loading...</div>`;
-    loadHistory();
+  // ---------------------------------------------- persistent previous runs
+  // Disk-backed history (survives restarts). The list comes from a server-side
+  // index (filters, sort, search and pagination run on the server); detail
+  // pages stream events so large runs never load whole into the browser.
+  const RUN_STATUSES = ["completed", "failed", "stopped", "interrupted", "running"];
+  const STATUS_GLYPH = { completed: "✓", failed: "✕", stopped: "■", interrupted: "⚠", running: "●" };
+  const RUNS_PAGE = 25;
+  const EVENTS_PAGE = 200;
+  const REPLAY_PAGE = 2000;
+  const REPLAY_EVENT_CAP = 20000;
+  const RUN_HASH_RE = /^#run=([\w-]+)\/([\w-]+)$/;
+  const enc = encodeURIComponent;
+  const runFilters = { status: "", sort: "newest", q: "" };
+  const runsView = { items: [], cursor: null, summary: null, token: 0, scroll: 0, open: null, lastCard: null };
+  let runsSearchTimer = null;
+
+  const statusOf = (run) => (run.running ? "running" : RUN_STATUSES.includes(run.status) ? run.status : "ended");
+  const statusBadge = (run) => {
+    const s = statusOf(run);
+    return `<span class="run-status ${s}"><span aria-hidden="true">${STATUS_GLYPH[s] || "•"}</span> ${esc(s)}</span>`;
+  };
+  const runTokenTotal = (run) => (run.input_tokens || 0) + (run.output_tokens || 0);
+  const runMeta = (run) =>
+    `${fmtDate(run.started_at || 0)} · ${fmtDur(run.duration_ms || 0)} · ${run.actions || 0} actions · ${run.steps || 0} steps` +
+    (runTokenTotal(run) ? ` · ${runTokenTotal(run).toLocaleString()} tokens` : "");
+
+  function groupLabel(ts) {
+    const day = new Date(ts * 1000);
+    const today = new Date();
+    const yesterday = new Date();
+    yesterday.setDate(today.getDate() - 1);
+    if (day.toDateString() === today.toDateString()) return "Today";
+    if (day.toDateString() === yesterday.toDateString()) return "Yesterday";
+    return day.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   }
 
-  function closeHistory() { historyDrawer.classList.add("hidden"); }
+  function updateRunsBadge(total) {
+    const badge = $("runsBadge");
+    if (!badge) return;
+    badge.textContent = String(total);
+    badge.classList.toggle("hidden", !total);
+  }
 
-  $("btnHistory").onclick = () =>
-    historyDrawer.classList.contains("hidden") ? openHistory() : closeHistory();
-  $("historyClose").onclick = closeHistory;
+  async function refreshRunsBadge() {
+    try {
+      const data = await fetchJson("/api/runs?limit=1");
+      updateRunsBadge(data.total_all || 0);
+    } catch { /* badge is cosmetic; the list reports its own errors */ }
+  }
+
+  function runsQueryUrl(cursor) {
+    const params = new URLSearchParams({ limit: String(RUNS_PAGE), sort: runFilters.sort });
+    if (runFilters.status) params.set("status", runFilters.status);
+    if (runFilters.q) params.set("q", runFilters.q);
+    if (cursor) params.set("cursor", cursor);
+    return `/api/runs?${params}`;
+  }
+
+  async function loadRuns(append = false) {
+    const list = $("runsList");
+    const token = ++runsView.token; // a newer request supersedes this one
+    let data;
+    try {
+      data = await fetchJson(runsQueryUrl(append ? runsView.cursor : null));
+    } catch {
+      if (token !== runsView.token) return;
+      list.innerHTML = errorRow("Could not load previous runs.", "runs");
+      bindRetry(list, () => loadRuns(false));
+      return;
+    }
+    if (token !== runsView.token) return;
+    runsView.items = append ? runsView.items.concat(data.runs) : data.runs;
+    runsView.cursor = data.next_cursor;
+    runsView.summary = data.summary;
+    updateRunsBadge(data.total_all || 0);
+    renderRuns();
+  }
+
+  function renderRunsSummary() {
+    const s = runsView.summary;
+    const el = $("runsSummary");
+    if (!s) { el.textContent = ""; return; }
+    const rate = s.success_rate == null ? "—" : `${Math.round(s.success_rate * 100)}%`;
+    el.textContent =
+      `${s.total.toLocaleString()} run${s.total === 1 ? "" : "s"} · ${rate} success · ${s.total_tokens.toLocaleString()} tokens`;
+  }
+
+  function renderRuns() {
+    const list = $("runsList");
+    renderRunsSummary();
+    $("runsMore").classList.toggle("hidden", !runsView.cursor);
+    if (!runsView.items.length) {
+      const filtered = runFilters.status || runFilters.q;
+      list.innerHTML = `<div class="pane-empty runs-empty">${filtered
+        ? "No runs match these filters."
+        : "No previous runs yet. Start a task and it will appear here."}</div>`;
+      return;
+    }
+    list.innerHTML = "";
+    const grouped = runFilters.sort === "newest" || runFilters.sort === "oldest";
+    let lastGroup = "";
+    for (const run of runsView.items) {
+      if (grouped) {
+        const label = groupLabel(run.started_at || 0);
+        if (label !== lastGroup) {
+          const heading = document.createElement("h3");
+          heading.className = "run-group";
+          heading.textContent = label;
+          list.appendChild(heading);
+          lastGroup = label;
+        }
+      }
+      const card = document.createElement("button");
+      card.type = "button";
+      card.className = "run-card";
+      card.dataset.sessionId = run.session_id;
+      card.dataset.runId = run.id;
+      const preview = run.final_preview || "";
+      card.innerHTML = `
+        <div class="run-card-top">
+          <span class="run-title">${esc(run.title || run.prompt_preview || "Task")}</span>
+          ${statusBadge(run)}
+        </div>
+        <div class="run-meta">${esc(runMeta(run))}</div>
+        ${preview ? `<div class="run-preview">${esc(preview)}</div>` : ""}
+        <div class="run-card-foot">${run.file_count ? `${run.file_count} produced file${run.file_count === 1 ? "" : "s"} · ` : ""}${run.read_only ? "Read-only history" : "Live run"}</div>`;
+      card.onclick = () => openRun(run.session_id, run.id);
+      list.appendChild(card);
+    }
+  }
+
+  function showRunsList() {
+    $("runDetail").classList.add("hidden");
+    $("runDetail").innerHTML = "";
+    $("runsListView").classList.remove("hidden");
+    runsView.open = null;
+    history.replaceState(null, "", `#s=${state.sessionId}`);
+    $("pane-runs").scrollTop = runsView.scroll;
+    const last = runsView.lastCard;
+    if (last) {
+      const card = document.querySelector(`.run-card[data-run-id="${CSS.escape(last.runId)}"]`);
+      (card || $("runsSearch")).focus({ preventScroll: true }); // keep the restored scroll position
+    }
+  }
+
+  // Screenshots are stored as blob references, never inline.
+  const blobUrl = (sessionId, ref) => `/api/blobs/${enc(sessionId)}/${enc(ref)}`;
+
+  const EVENT_LABEL = {
+    run_start: "Prompt", thought: "Thought", step: "Step", plan: "Plan", tool_start: "Tool started",
+    tool_end: "Tool finished", terminal: "Terminal", final_result: "Final answer", run_end: "Run ended",
+    error: "Error", status: "Status", usage: "Token usage", file_update: "File update",
+    browser_screenshot: "Screenshot", control: "Operator action", auth_required: "Authorization",
+    ask_human: "Question for you",
+  };
+
+  function eventLine(event) {
+    const d = event.data || {};
+    const first = (text) => String(text || "").split("\n")[0].slice(0, 140);
+    switch (event.type) {
+      case "run_start": return first(d.prompt);
+      case "thought": case "final_result": return first(d.content);
+      case "tool_start": return d.name || "";
+      case "tool_end": return `${d.name || ""} ${d.ok === false ? "failed" : "ok"}`;
+      case "error": return first(d.message);
+      case "status": return first(d.message || d.status);
+      case "file_update": return d.path || "";
+      default: return "";
+    }
+  }
+
+  function renderEventRows(sessionId, events, container) {
+    for (const event of events) {
+      const payload = event.data || {};
+      const json = JSON.stringify(payload, null, 2);
+      const row = document.createElement("details");
+      row.className = "run-event";
+      const shot = payload.image_ref
+        ? `<img class="re-shot" loading="lazy" alt="Browser screenshot" src="${esc(blobUrl(sessionId, payload.image_ref))}" />`
+        : "";
+      row.innerHTML = `
+        <summary><span class="re-type">${esc(EVENT_LABEL[event.type] || event.type)}</span><code>${esc(event.type)}</code>
+          <span class="re-line">${esc(eventLine(event))}</span>
+          <time>${esc(payload.ts ? new Date(payload.ts).toLocaleTimeString() : "")}</time></summary>
+        <div class="re-body">${shot}<div class="re-tools">${copyBtnHtml(0, "event JSON")}</div><pre>${esc(json)}</pre></div>`;
+      wireCopyButtons(row, [json]);
+      container.appendChild(row);
+    }
+  }
+
+  async function loadRunEvents(append) {
+    const open = runsView.open;
+    if (!open) return;
+    const { run } = open;
+    const params = new URLSearchParams({ offset: String(append ? open.events : 0), limit: String(EVENTS_PAGE) });
+    if (open.types) params.set("types", open.types);
+    const data = await fetchJson(`/api/runs/${enc(run.session_id)}/${enc(run.id)}?${params}`);
+    if (runsView.open !== open) return;
+    const list = $("runEventList");
+    if (!append) { list.innerHTML = ""; open.events = 0; }
+    renderEventRows(run.session_id, data.events, list);
+    open.events += data.events.length;
+    open.total = data.total_events;
+    $("runEventsCount").textContent = String(open.total);
+    $("runEventsMore").classList.toggle("hidden", open.events >= open.total);
+    if (!open.total) list.innerHTML = `<div class="pane-empty">No events recorded for this selection.</div>`;
+  }
+
+  async function fetchAllRunEvents(sessionId, runId) {
+    const out = [];
+    let total = Infinity;
+    while (out.length < total && out.length < REPLAY_EVENT_CAP) {
+      const data = await fetchJson(
+        `/api/runs/${enc(sessionId)}/${enc(runId)}?offset=${out.length}&limit=${REPLAY_PAGE}`);
+      total = data.total_events;
+      if (!data.events.length) break;
+      out.push(...data.events);
+    }
+    return { events: out, total: Number.isFinite(total) ? total : out.length };
+  }
+
+  async function openRun(sessionId, runId) {
+    const detail = $("runDetail");
+    runsView.scroll = $("pane-runs").scrollTop;
+    runsView.lastCard = { sessionId, runId };
+    $("runsListView").classList.add("hidden");
+    detail.classList.remove("hidden");
+    $("pane-runs").scrollTop = 0; // the detail opens at its top
+    detail.innerHTML = `<div class="pane-empty">Loading run history…</div>`;
+    history.replaceState(null, "", `#run=${sessionId}/${runId}`);
+    let data;
+    try {
+      data = await fetchJson(`/api/runs/${enc(sessionId)}/${enc(runId)}?offset=0&limit=${EVENTS_PAGE}`);
+    } catch {
+      detail.innerHTML = `<button class="btn-ghost sm" id="runBack" type="button">← All runs</button>${errorRow("Could not load this run.", "run")}`;
+      $("runBack").onclick = showRunsList;
+      bindRetry(detail, () => openRun(sessionId, runId));
+      return;
+    }
+    const run = data.run;
+    runsView.open = { run, events: 0, total: data.total_events, types: "" };
+    const files = (run.files || []).map((path) =>
+      `<li><a href="/api/download?path=${enc(path)}" download>${esc(path)}</a></li>`).join("");
+    detail.innerHTML = `
+      <div class="run-detail-head">
+        <button class="btn-ghost sm" id="runBack" type="button">← All runs</button>
+        <span class="run-readonly">${data.read_only ? "Read-only historical run" : "Live run snapshot"}</span>
+      </div>
+      <div class="run-detail-title"><h3 id="runDetailTitle" tabindex="-1">${esc(run.title || run.prompt || "Task")}</h3>${statusBadge(run)}</div>
+      <div class="run-meta">${esc(runMeta(run))}</div>
+      <div class="run-actions" role="group" aria-label="Run actions">
+        <button class="btn-ghost sm" id="runReplay" type="button">Open replay</button>
+        <button class="btn-ghost sm" id="runOpenSession" type="button">Open session</button>
+        <button class="btn-ghost sm" id="runRerun" type="button">Re-run this prompt</button>
+        <button class="btn-ghost sm" id="runContinue" type="button">Continue from this run</button>
+        <button class="btn-ghost sm" id="runExportMd" type="button">Export Markdown</button>
+        <button class="btn-ghost sm" id="runExportJson" type="button">Export JSON</button>
+        <button class="btn-ghost sm danger" id="runDelete" type="button">Delete session</button>
+      </div>
+      <section class="run-section"><div class="run-section-head"><h4>Prompt</h4>${copyBtnHtml(0, "prompt")}</div><div class="run-prompt">${esc(run.prompt || "")}</div></section>
+      <section class="run-section"><div class="run-section-head"><h4>Final response</h4>${copyBtnHtml(1, "final response")}</div><div class="run-final">${run.final_response ? markdown(run.final_response) : "No final response recorded."}</div></section>
+      ${files ? `<section class="run-section"><h4>Produced files</h4><ul class="run-files">${files}</ul></section>` : ""}
+      <section class="run-section">
+        <details id="runEventsBox">
+          <summary class="run-events-summary">Event inspector (<span id="runEventsCount">${data.total_events}</span> events)</summary>
+          <div class="run-events-tools">
+            <label>Show <select id="runEventType" aria-label="Filter events by type">
+              <option value="">All events</option>
+              <option value="thought">Thoughts</option>
+              <option value="tool_start,tool_end">Tool calls</option>
+              <option value="terminal">Terminal</option>
+              <option value="file_update">File updates</option>
+              <option value="browser_screenshot">Screenshots</option>
+              <option value="error,status">Errors and status</option>
+            </select></label>
+          </div>
+          <div id="runEventList"></div>
+          <button class="btn-ghost sm hidden" id="runEventsMore" type="button">Load more events</button>
+        </details>
+      </section>`;
+    wireCopyButtons(detail, [run.prompt || "", run.final_response || ""]);
+    renderEventRows(run.session_id, data.events, $("runEventList"));
+    runsView.open.events = data.events.length;
+    $("runEventsMore").classList.toggle("hidden", runsView.open.events >= runsView.open.total);
+    $("runBack").onclick = showRunsList;
+    $("runReplay").onclick = () => startReplay(run);
+    $("runOpenSession").onclick = () => switchSession(run.session_id, false);
+    $("runRerun").onclick = () => startNewTaskWith(run.prompt || "", "Prompt copied from a previous run — review it, then send.");
+    $("runContinue").onclick = () => startNewTaskWith(continuationText(run),
+      "Seeded from a previous run. The agent's state is not restored — only this text is carried over.");
+    $("runExportMd").onclick = () => exportRun(run, "md");
+    $("runExportJson").onclick = () => exportRun(run, "json");
+    $("runDelete").onclick = () => deleteRunSession(run);
+    $("runEventsMore").onclick = () => loadRunEvents(true);
+    $("runEventType").onchange = (e) => { runsView.open.types = e.target.value; loadRunEvents(false); };
+    $("runDetailTitle").focus();
+  }
+
+  function continuationText(run) {
+    const clip = (text, n) => (text.length > n ? `${text.slice(0, n)}…` : text);
+    return "Context from an earlier run (the agent's state is not restored; only this text is carried over):\n\n" +
+      `Previous task:\n${clip(run.prompt || "", 2000)}\n\n` +
+      `Previous result:\n${clip(run.final_response || "(no final response recorded)", 4000)}\n\n` +
+      "New request:\n";
+  }
+
+  function startNewTaskWith(text, notice) {
+    resetToNewSession();
+    input.value = text;
+    autosize();
+    syncSend();
+    switchTab("live", true);
+    input.focus();
+    showToast(notice, "info", 6000);
+  }
+
+  async function deleteRunSession(run) {
+    const ok = await confirmDialog(
+      "Delete this session and ALL of its runs and events from disk? This cannot be undone.",
+      { danger: true, confirmLabel: "Delete" });
+    if (!ok) return;
+    try {
+      await fetchJson(`/api/sessions/${enc(run.session_id)}`, { method: "DELETE" });
+    } catch {
+      showToast("Could not delete the session — check your connection and try again.", "error");
+      return;
+    }
+    if (run.session_id === state.sessionId) resetToNewSession();
+    showRunsList();
+    loadRuns(false);
+  }
+
+  function downloadText(filename, text, type) {
+    const url = URL.createObjectURL(new Blob([text], { type }));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  async function exportRun(run, kind) {
+    let all;
+    try {
+      all = await fetchAllRunEvents(run.session_id, run.id);
+    } catch {
+      showToast("Could not load the run for export.", "error");
+      return;
+    }
+    const slug = (run.title || "run").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "run";
+    const base = `openmanus-${slug}-${run.id.slice(0, 8)}`;
+    if (kind === "json") {
+      downloadText(`${base}.json`, JSON.stringify({ run, events: all.events }, null, 2), "application/json");
+      return;
+    }
+    const lines = [
+      `# ${run.title || "Run"}`, "",
+      `- Status: ${statusOf(run)}`, `- Started: ${absoluteTime(run.started_at * 1000)}`,
+      `- ${runMeta(run)}`, "", "## Prompt", "", run.prompt || "", "",
+      "## Final response", "", run.final_response || "(none recorded)", "",
+    ];
+    if ((run.files || []).length) lines.push("## Produced files", "", ...run.files.map((f) => `- \`${f}\``), "");
+    lines.push("## Timeline", "");
+    for (const e of all.events) {
+      if (["usage", "step", "plan"].includes(e.type)) continue;
+      const when = e.data?.ts ? new Date(e.data.ts).toLocaleTimeString() : "";
+      lines.push(`- ${when} **${EVENT_LABEL[e.type] || e.type}** ${eventLine(e)}`.trimEnd());
+    }
+    downloadText(`${base}.md`, `${lines.join("\n")}\n`, "text/markdown");
+  }
+
+  // --- replay: render one historical run through the existing panes (read-only)
+  async function startReplay(run) {
+    let all;
+    try {
+      all = await fetchAllRunEvents(run.session_id, run.id);
+    } catch {
+      showToast("Could not load the run for replay.", "error");
+      return;
+    }
+    state.replayMode = { sessionId: run.session_id, runId: run.id };
+    setReadOnly(true);
+    setRunning(false);
+    resetPanes();
+    state.files.clear();
+    state.outputsDirty = true;
+    state.pinnedTab = false;
+    state.replaying = true;
+    for (const event of all.events) {
+      try { HANDLERS[event.type]?.(event.data || {}); } catch (err) { console.error("replay handler failed", err); }
+    }
+    state.replaying = false;
+    const capped = all.total > all.events.length ? ` (first ${all.events.length.toLocaleString()} of ${all.total.toLocaleString()} events)` : "";
+    $("replayLabel").textContent = `Replaying "${run.title || "run"}" — read-only${capped}`;
+    $("replayBanner").classList.remove("hidden");
+    switchTab("live", true);
+    scrollDown(messages);
+    scrollDown($("pane-live"));
+  }
+
+  // Detach the old socket's handlers so closing it can't trigger its
+  // reconnect logic, then rebuild the UI from the server's event log.
+  function reconnectFresh() {
+    const old = state.ws;
+    state.ws = null;
+    if (old) { old.onclose = null; old.onmessage = null; old.close(); }
+    clearTimeout(reconnectTimer);
+    connect();
+  }
+
+  function clearReplayMode() {
+    state.replayMode = null;
+    $("replayBanner").classList.add("hidden");
+  }
+
+  function exitReplay() {
+    clearReplayMode();
+    setReadOnly(false); // the server re-asserts read-only via session_info if needed
+    resetPanes();
+    state.files.clear();
+    state.outputsDirty = true;
+    reconnectFresh();
+  }
+
+  function openRunFromHash() {
+    const match = location.hash.match(RUN_HASH_RE);
+    if (!match) return false;
+    switchTab("runs", true);
+    openRun(match[1], match[2]);
+    return true;
+  }
+
+  $("btnHistory").onclick = () => switchTab("runs", true);
+  $("replayExit").onclick = exitReplay;
+  $("runsRefresh").onclick = () => loadRuns(false);
+  $("runsMore").onclick = () => loadRuns(true);
+  $("runsSort").addEventListener("change", (e) => { runFilters.sort = e.target.value; loadRuns(false); });
+  $("runsSearch").addEventListener("input", () => {
+    clearTimeout(runsSearchTimer);
+    runsSearchTimer = setTimeout(() => { runFilters.q = $("runsSearch").value.trim(); loadRuns(false); }, 250);
+  });
+  document.querySelectorAll(".run-chip").forEach((chip) => chip.addEventListener("click", () => {
+    runFilters.status = chip.dataset.status;
+    document.querySelectorAll(".run-chip").forEach((other) => {
+      const on = other.dataset.status === runFilters.status;
+      other.classList.toggle("active", on);
+      other.setAttribute("aria-pressed", String(on));
+    });
+    loadRuns(false);
+  }));
+  window.addEventListener("hashchange", () => {
+    if (!openRunFromHash() && runsView.open) showRunsList();
+  });
 
   $("btnLogout").onclick = async () => {
-    if (!confirm("Sign out? You'll need your password again to get back in.")) return;
+    if (!(await confirmDialog("Sign out? You'll need your password again to get back in.", { confirmLabel: "Sign out" }))) return;
     try {
       await fetch("/api/logout", { method: "POST" });
     } catch {
@@ -890,11 +1295,21 @@
   };
 
   // -------------------------------------------------------- run state UI
+  function setReadOnly(on) {
+    state.readOnly = Boolean(on);
+    $("promptInput").disabled = state.readOnly || state.running;
+    $("promptInput").placeholder = state.readOnly
+      ? "Historical session — read-only. Click New to start a task."
+      : "Give OpenManus a task...";
+    syncSend();
+  }
+
   function setRunning(on) {
     state.running = on;
     $("btnSend").classList.toggle("hidden", on);
     $("btnStop").classList.toggle("hidden", !on);
-    $("promptInput").disabled = on;
+    $("promptInput").disabled = on || state.readOnly;
+    $("runsLiveDot")?.classList.toggle("hidden", !on);
     const pill = $("livePill");
     pill.classList.toggle("running", on);
     pill.classList.remove("stopped");
@@ -909,6 +1324,20 @@
 
   // -------------------------------------------------------- events
   const HANDLERS = {
+    session_info(ev) {
+      setReadOnly(Boolean(ev.read_only));
+      if (ev.runs_total != null && ev.runs_shown < ev.runs_total) {
+        showToast(`Showing the latest ${ev.runs_shown} of ${ev.runs_total} runs of this session. Open Previous Runs for the rest.`, "info", 7000);
+      }
+    },
+    history_degraded(ev) {
+      $("historyBannerText").textContent = ev.message || "Run history is not being saved right now.";
+      $("historyBanner").classList.remove("hidden");
+    },
+    history_recovered(ev) {
+      $("historyBanner").classList.add("hidden");
+      showToast(ev.message || "Run history saving has recovered.", "info");
+    },
     replay(ev) {
       // Reset UI and re-dispatch the session's event history in order.
       state.replaying = true;
@@ -922,7 +1351,10 @@
       scrollDown($("pane-live"));
     },
     run_start(ev) {
-      setRunning(true);
+      setRunning(!state.readOnly);
+      // UX-002: anchor the elapsed clock to the server's run_start timestamp
+      // (survives reload/replay; setRunning() just used client receive time).
+      if (ev.ts) state.startedAt = ev.ts;
       state.pinnedTab = false;
       state.toolCards.clear();
       state.actionCount = 0;
@@ -932,7 +1364,7 @@
       syncSend();
       dropActivityPill();
       addUserMessage(ev.prompt);
-      if (!historyDrawer.classList.contains("hidden")) loadHistory();
+      if (!state.replaying) { if (state.activeTab === "runs") loadRuns(false); else refreshRunsBadge(); }
     },
     thought(ev) {
       addThought(ev.content);
@@ -943,7 +1375,7 @@
         <div class="tl-icon chat">${icon("i-chat")}</div>
         <div class="tl-body"><div class="tl-title">Thinking</div>
         <div class="tl-detail">${esc((ev.content || "").split("\n")[0].slice(0, 90))}</div></div>
-        <div class="tl-time">${fmtTime()}</div>`;
+        <div class="tl-time">${fmtEventTime(ev)}</div>`;
       timeline.appendChild(el);
       scrollDown($("pane-live"));
     },
@@ -983,8 +1415,11 @@
         pill.querySelector(".ap-status").innerHTML = icon("i-x");
       }
     },
-    terminal(ev) { addTerminalBlock(ev.code, ev.output); },
-    browser_screenshot(ev) { setScreenshot(ev.image); },
+    terminal(ev) { addTerminalBlock(ev.code, ev.output, ev); },
+    browser_screenshot(ev) {
+      if (ev.image) setScreenshot(ev.image);
+      else if (ev.image_ref) setScreenshotUrl(blobUrl(state.replayMode?.sessionId || state.sessionId, ev.image_ref));
+    },
     browser_meta(ev) {
       $("browserUrl").textContent = ev.title ? `${ev.title} — ${ev.url}` : (ev.url || "");
     },
@@ -1039,18 +1474,21 @@
         const pill = $("livePill");
         pill.classList.add("stopped");
         $("liveLabel").textContent = "Stopped";
-        finalizeActivityPill(false);
+        finalizeActivityPill(false, ev);
         state.runOutcome = "stopped";
       }
     },
     error(ev) { addError(ev.message); state.runOutcome = "failed"; },
-    run_end() {
+    run_end(ev) {
       setRunning(false);
       state.submitPending = false;
       syncSend();
-      finalizeActivityPill(state.runOutcome !== "stopped");
-      addRunReport();
+      finalizeActivityPill(state.runOutcome !== "stopped", ev);
+      addRunReport(ev);
+      // UX-002: freeze the header clock at the true run duration (replay-safe).
+      if (ev && ev.ts) $("elapsedStat").textContent = fmtEventTime(ev);
       state.runOutcome = "";
+      if (!state.replaying) { if (state.activeTab === "runs") loadRuns(false); else refreshRunsBadge(); }
     },
     usage(ev) {
       state.tokens.in = ev.total_in;
@@ -1071,7 +1509,7 @@
       el.innerHTML = `
         <div class="tl-icon chat">${icon("i-chat")}</div>
         <div class="tl-body"><div class="tl-title">${esc(label)}</div></div>
-        <div class="tl-time" title="${esc(absoluteTime(Date.now()))}">${fmtTime()}</div>`;
+        <div class="tl-time" title="${esc(absoluteTime(ev.ts || Date.now()))}">${fmtEventTime(ev)}</div>`;
       timeline.appendChild(el);
       scrollDown($("pane-live"));
     },
@@ -1152,10 +1590,12 @@
     ws.onmessage = (e) => {
       let msg;
       try { msg = JSON.parse(e.data); } catch { return; }
+      if (state.replayMode) return; // a historical run is on screen; the live view rebuilds on exit
       const h = HANDLERS[msg.type];
       if (h) { try { h(msg.data || {}); } catch (err) { console.error("event handler failed", err); } }
     };
     ws.onclose = (ev) => {
+      if (state.ws && state.ws !== ws) return; // a newer socket already replaced this one
       state.ws = null;
       if (state.intentionalClose) return;
       // Code 1008 = policy violation (auth/session/origin rejected server-side).
@@ -1180,6 +1620,10 @@
   const input = $("promptInput");
 
   function submitPrompt() {
+    if (state.readOnly) {
+      showToast("Historical sessions are read-only. Click New to start a task.", "info");
+      return;
+    }
     const decision = composerDecision(
       input.value,
       state.ws?.readyState === WebSocket.OPEN,
@@ -1191,7 +1635,12 @@
       addError("Not connected — prompt kept. Reconnecting; try again in a moment.");
       return;
     }
-    if (decision.action === "block-running" || decision.action === "block-pending") return;
+    if (decision.action === "block-pending") {
+      // UX-001: the pending window used to swallow re-submits silently — say why.
+      showToast("Run request already sent — the agent is starting…", "info", 2500);
+      return;
+    }
+    if (decision.action === "block-running") return;
     let prompt = input.value.trim();
     if (state.uploaded.length) {
       // Point the agent at the files it just received (they live in the workspace).
@@ -1269,10 +1718,86 @@
   document.querySelectorAll(".tab").forEach((tab) =>
     tab.addEventListener("click", () => switchTab(tab.dataset.tab, true)));
 
-  $("btnNew").onclick = () => {
-    resetToNewSession();
-    if (!historyDrawer.classList.contains("hidden")) loadHistory();
-  };
+  $("btnNew").onclick = () => resetToNewSession();
+
+  // -------------------------------------------------------- dialogs (A11Y-003)
+  // Shared modal behavior: focus moves into the dialog on open, Tab and
+  // Shift+Tab cycle within it, Escape closes, and focus returns to the
+  // trigger element on close. Overlays keep their role="dialog" semantics in
+  // the markup; this supplies the focus half of the contract.
+  function dialogFocusables(overlay) {
+    const box = overlay.querySelector(".modal") || overlay;
+    return [...box.querySelectorAll(
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )].filter((el) => el.offsetParent !== null);
+  }
+
+  function openDialog(overlay, trigger) {
+    overlay._trigger = trigger || document.activeElement;
+    overlay.classList.remove("hidden");
+    const first = dialogFocusables(overlay)[0];
+    if (first) first.focus();
+    if (!overlay._trapBound) {
+      overlay._trapBound = true;
+      overlay.addEventListener("keydown", (e) => {
+        if (e.key !== "Tab") return;
+        const els = dialogFocusables(overlay);
+        if (!els.length) return;
+        const firstEl = els[0], lastEl = els[els.length - 1];
+        if (e.shiftKey && document.activeElement === firstEl) { e.preventDefault(); lastEl.focus(); }
+        else if (!e.shiftKey && document.activeElement === lastEl) { e.preventDefault(); firstEl.focus(); }
+      });
+    }
+  }
+
+  function closeDialog(overlay) {
+    overlay.classList.add("hidden");
+    overlay.dispatchEvent(new CustomEvent("dialog:closed"));
+    const trigger = overlay._trigger;
+    overlay._trigger = null;
+    if (trigger && document.contains(trigger)) trigger.focus();
+  }
+
+  // Escape closes the topmost open dialog, regardless of where focus sits
+  // (the per-overlay Tab trap only fires while focus is inside it).
+  document.addEventListener("keydown", (e) => {
+    if (e.key !== "Escape") return;
+    const open = [...document.querySelectorAll(".modal-overlay:not(.hidden)")].pop();
+    if (open) closeDialog(open);
+  });
+
+  // UX-006: styled in-app confirmation replacing native confirm() — resolves
+  // true/false, traps focus (via openDialog), Escape/Cancel = false.
+  function confirmDialog(message, { danger = false, confirmLabel = "Confirm" } = {}) {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      overlay.className = "modal-overlay confirm-overlay";
+      overlay.innerHTML = `
+        <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-label="Confirmation">
+          <div class="confirm-text">${esc(message)}</div>
+          <div class="form-actions">
+            <button type="button" class="btn-ghost" data-x="cancel">Cancel</button>
+            <button type="button" class="btn-primary${danger ? " danger" : ""}" data-x="ok">${esc(confirmLabel)}</button>
+          </div>
+        </div>`;
+      document.body.appendChild(overlay);
+      let settled = false;
+      const done = (val) => {
+        if (settled) return;
+        settled = true;
+        // Escape arrives via the global handler (already closed us); button
+        // and backdrop paths close here (fires dialog:closed, guarded).
+        if (!overlay.classList.contains("hidden")) closeDialog(overlay);
+        overlay.remove();
+        resolve(val);
+      };
+      overlay.addEventListener("dialog:closed", () => done(false)); // Escape/backdrop path
+      overlay.querySelector('[data-x="cancel"]').onclick = () => done(false);
+      overlay.querySelector('[data-x="ok"]').onclick = () => done(true);
+      overlay.addEventListener("click", (e) => { if (e.target === overlay) done(false); });
+      openDialog(overlay, document.activeElement);
+    });
+  }
 
   const applyZoom = () => {
     state.zoom = Math.min(2, Math.max(0.25, state.zoom));
@@ -1316,10 +1841,18 @@
       list.innerHTML = `<div class="pane-empty">No models configured.</div>`;
       return;
     }
+    // A11Y-005: cards present as a radio group (visual radios already), so
+    // keyboard/AT users can review and switch the active model — previously
+    // mouse-only. Roving tabindex: the active card (else the first) is the
+    // tab stop; arrows move between cards; Enter/Space selects.
+    const cards = [];
     for (const m of modelsData.models) {
       const isActive = m.id === modelsData.active;
       const card = document.createElement("div");
       card.className = "model-card" + (isActive ? " active" : "");
+      card.setAttribute("role", "radio");
+      card.setAttribute("aria-checked", isActive ? "true" : "false");
+      cards.push(card);
       card.innerHTML = `
         <span class="model-radio"></span>
         <div class="model-info">
@@ -1334,19 +1867,9 @@
           <button class="btn-icon" data-act="edit" title="Edit"><svg class="ic"><use href="#i-edit"/></svg></button>
           <button class="btn-icon danger" data-act="del" title="Delete"><svg class="ic"><use href="#i-trash"/></svg></button>
         </div>` : ""}`;
-      card.onclick = async (e) => {
-        const act = e.target.closest("[data-act]")?.dataset.act;
-        if (act === "edit") { startEdit(m); return; }
+      const selectModel = async () => {
+        if (isActive) return;
         try {
-          if (act === "del") {
-            e.stopPropagation();
-            if (!confirm(`Delete model "${m.label}"? This cannot be undone.`)) return;
-            const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
-            if (res.ok) { await reloadModels(); formMsg("Model deleted"); }
-            else formMsg((await res.json()).detail || "Delete failed", true);
-            return;
-          }
-          if (isActive) return;
           const res = await fetch("/api/models/active", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -1361,8 +1884,47 @@
           formMsg("Request failed — check your connection and try again.", true);
         }
       };
+      card.onclick = async (e) => {
+        const act = e.target.closest("[data-act]")?.dataset.act;
+        if (act === "edit") { startEdit(m); return; }
+        if (act === "del") {
+          e.stopPropagation();
+          if (!(await confirmDialog(`Delete model "${m.label}"? This cannot be undone.`, { danger: true, confirmLabel: "Delete" }))) return;
+          try {
+            const res = await fetch(`/api/models/${encodeURIComponent(m.id)}`, { method: "DELETE" });
+            if (res.ok) { await reloadModels(); formMsg("Model deleted"); }
+            else formMsg((await res.json()).detail || "Delete failed", true);
+          } catch {
+            formMsg("Request failed — check your connection and try again.", true);
+          }
+          return;
+        }
+        await selectModel();
+      };
       list.appendChild(card);
     }
+    // Roving tabindex + keyboard operation for the radio group (A11Y-005).
+    const activeIdx = Math.max(0, cards.findIndex((c) => c.getAttribute("aria-checked") === "true"));
+    cards.forEach((c, i) => (c.tabIndex = i === activeIdx ? 0 : -1));
+    list.onkeydown = (e) => {
+      const idx = cards.indexOf(e.target.closest(".model-card"));
+      if (idx === -1) return;
+      const move = (next) => {
+        cards.forEach((c) => (c.tabIndex = -1));
+        next.tabIndex = 0;
+        next.focus();
+      };
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") {
+        e.preventDefault();
+        move(cards[(idx + 1) % cards.length]);
+      } else if (e.key === "ArrowUp" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        move(cards[(idx - 1 + cards.length) % cards.length]);
+      } else if ((e.key === "Enter" || e.key === " ") && !e.target.closest("[data-act]")) {
+        e.preventDefault();
+        cards[idx].click();
+      }
+    };
   }
 
   async function reloadModels() {
@@ -1465,21 +2027,18 @@
 
   $("formCancel").onclick = resetForm;
 
-  function openModal() {
-    modal.classList.remove("hidden");
+  function openModal(trigger) {
+    openDialog(modal, trigger);
     $("modelList").innerHTML = `<div class="pane-empty">Loading models...</div>`;
     reloadModels().then(fillPresets).catch(() => {
       $("modelList").innerHTML = `<div class="pane-empty">Could not load models.</div>`;
     });
   }
 
-  $("btnSettings").onclick = openModal;
-  $("modelChip").onclick = openModal;
-  $("modalClose").onclick = () => modal.classList.add("hidden");
-  modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.classList.contains("hidden")) modal.classList.add("hidden");
-  });
+  $("btnSettings").onclick = (e) => openModal(e.currentTarget);
+  $("modelChip").onclick = (e) => openModal(e.currentTarget);
+  $("modalClose").onclick = () => closeDialog(modal);
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeDialog(modal); });
 
   // -------------------------------------------------------- MCP servers
   const mcpModal = $("mcpModal");
@@ -1553,8 +2112,8 @@
     }
   }
 
-  async function openMcpModal() {
-    mcpModal.classList.remove("hidden");
+  async function openMcpModal(trigger) {
+    openDialog(mcpModal, trigger);
     $("mcpList").innerHTML = `<div class="pane-empty">Loading servers...</div>`;
     try {
       mcpServers = await fetchMcpServers();
@@ -1564,17 +2123,14 @@
     }
   }
 
-  $("btnMcp").onclick = openMcpModal;
-  $("mcpModalClose").onclick = () => mcpModal.classList.add("hidden");
-  mcpModal.addEventListener("click", (e) => { if (e.target === mcpModal) mcpModal.classList.add("hidden"); });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !mcpModal.classList.contains("hidden")) mcpModal.classList.add("hidden");
-  });
+  $("btnMcp").onclick = (e) => openMcpModal(e.currentTarget);
+  $("mcpModalClose").onclick = () => closeDialog(mcpModal);
+  mcpModal.addEventListener("click", (e) => { if (e.target === mcpModal) closeDialog(mcpModal); });
 
   updateModelChip();
 
   // Keep the send button enabled only when there is text and agent is idle.
-  const syncSend = () => { $("btnSend").disabled = !input.value.trim() || state.running || state.submitPending; };
+  const syncSend = () => { $("btnSend").disabled = state.readOnly || !input.value.trim() || state.running || state.submitPending; };
   input.addEventListener("input", syncSend);
   new MutationObserver(syncSend).observe($("btnStop"), { attributes: true, attributeFilter: ["class"] });
 
@@ -1609,11 +2165,13 @@
 
   // Regression-test hooks (Playwright); inert in normal use.
   window.__om = {
-    state, send, submitPrompt, switchTab, setReconnecting,
+    state, send, submitPrompt, switchTab, setReconnecting, loadRuns, openRun, exitReplay,
     // Test-only event dispatcher: drives the same HANDLERS a real WS message
     // would, without needing a live agent run. Inert in normal use.
     dispatch: (type, data) => HANDLERS[type]?.(data || {}),
   };
 
   connect();
+  refreshRunsBadge();
+  openRunFromHash();
 })();

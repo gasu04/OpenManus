@@ -10,6 +10,9 @@
   <div class="reconnect-banner hidden" id="reconnectBanner" role="alert" aria-live="assertive">
     <span class="spinner"></span><span id="reconnectLabel">Connection lost — reconnecting...</span>
   </div>
+  <div class="reconnect-banner history-banner hidden" id="historyBanner" role="alert">
+    <span id="historyBannerText">Run history is not being saved right now.</span>
+  </div>
   <svg width="0" height="0" style="position:absolute" aria-hidden="true">
     <defs>
       <symbol id="i-logo" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.5 2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
@@ -61,7 +64,7 @@
           <button class="btn-icon" id="btnLogout" title="Sign out" aria-label="Sign out">
             <svg class="ic"><use href="#i-logout"/></svg>
           </button>
-          <button class="btn-icon" id="btnHistory" title="Past tasks" aria-label="Past tasks">
+          <button class="btn-icon" id="btnHistory" title="Previous runs" aria-label="Previous runs">
             <svg class="ic"><use href="#i-history"/></svg>
           </button>
           <button class="btn-icon" id="btnMcp" title="MCP servers" aria-label="MCP servers">
@@ -77,25 +80,11 @@
         </div>
       </header>
 
-      <div class="history-drawer hidden" id="historyDrawer">
-        <header class="history-head">
-          <span>Past tasks</span>
-          <button class="btn-icon" id="historyClose" title="Close" aria-label="Close history"><svg class="ic"><use href="#i-x"/></svg></button>
-        </header>
-        <div class="history-search">
-          <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
-          <input type="search" id="historySearch" placeholder="Filter tasks by title…" aria-label="Filter task history by title" />
-        </div>
-        <div class="history-list" id="historyList">
-          <div class="pane-empty">No past tasks yet.</div>
-        </div>
-      </div>
-
       <div class="messages" id="messages">
         <div class="welcome" id="welcome">
           <svg class="welcome-logo"><use href="#i-logo"/></svg>
           <h1>Hi, I'm OpenManus.</h1>
-          <p>What can I do for you? I can browse the web, run code, and edit files — you'll see every step live in the panel on the right.</p>
+          <p>What can I do for you? I can browse the web, run code, and edit files — you'll see every step live in the OpenManus's Computer panel.</p>
         </div>
       </div>
 
@@ -106,7 +95,7 @@
           <button class="btn-icon" id="btnUpload" title="Attach files for the agent" aria-label="Attach files for the agent">
             <svg class="ic"><use href="#i-paperclip"/></svg>
           </button>
-          <textarea id="promptInput" rows="1" placeholder="Give Manus a task..."></textarea>
+          <textarea id="promptInput" rows="1" placeholder="Give OpenManus a task..." aria-label="Task prompt"></textarea>
           <button class="btn-send" id="btnSend" title="Send" disabled>
             <svg class="ic"><use href="#i-send"/></svg>
           </button>
@@ -136,12 +125,18 @@
         </div>
       </header>
 
+      <div class="replay-banner hidden" id="replayBanner" role="status">
+        <span id="replayLabel"></span>
+        <button class="btn-ghost sm" id="replayExit" type="button">Exit replay</button>
+      </div>
+
       <nav class="tabs" id="tabs" role="tablist" aria-label="Agent activity views">
         <button class="tab active" role="tab" aria-selected="true" aria-controls="pane-live" id="tab-live" data-tab="live"><svg class="ic" aria-hidden="true"><use href="#i-bolt"/></svg>Live</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-browser" id="tab-browser" tabindex="-1" data-tab="browser"><svg class="ic" aria-hidden="true"><use href="#i-globe"/></svg>Browser</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-terminal" id="tab-terminal" tabindex="-1" data-tab="terminal"><svg class="ic" aria-hidden="true"><use href="#i-terminal"/></svg>Terminal</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-editor" id="tab-editor" tabindex="-1" data-tab="editor"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>Editor</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-files" id="tab-files" tabindex="-1" data-tab="files"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>Files</button>
+        <button class="tab" role="tab" aria-selected="false" aria-controls="pane-runs" id="tab-runs" tabindex="-1" data-tab="runs"><svg class="ic" aria-hidden="true"><use href="#i-history"/></svg>Previous Runs <span class="badge hidden" id="runsBadge"></span><span class="tab-live-dot hidden" id="runsLiveDot" title="A run is in progress"></span></button>
       </nav>
 
       <div class="tab-content">
@@ -194,26 +189,64 @@
             </div>
           </div>
         </div>
+
+        <!-- Persistent run history -->
+        <div class="pane" id="pane-runs" role="tabpanel" aria-labelledby="tab-runs" tabindex="0">
+          <div class="runs-wrap">
+            <div id="runsListView">
+              <div class="runs-head">
+                <div>
+                  <h2>Previous Runs</h2>
+                  <p>Disk-backed history, available after restarts.</p>
+                </div>
+                <button class="btn-icon" id="runsRefresh" title="Refresh previous runs" aria-label="Refresh previous runs"><svg class="ic"><use href="#i-refresh"/></svg></button>
+              </div>
+              <div class="runs-search" id="runsSearchWrap">
+                <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+                <input type="search" id="runsSearch" placeholder="Search prompts, titles, and answers…" aria-label="Search previous runs" />
+                <select id="runsSort" aria-label="Sort runs">
+                  <option value="newest">Newest</option>
+                  <option value="oldest">Oldest</option>
+                  <option value="duration">Longest</option>
+                  <option value="tokens">Most tokens</option>
+                </select>
+              </div>
+              <div class="run-chips" role="group" aria-label="Filter by status">
+                <button type="button" class="run-chip active" data-status="" aria-pressed="true">All</button>
+                <button type="button" class="run-chip" data-status="completed" aria-pressed="false">Completed</button>
+                <button type="button" class="run-chip" data-status="failed" aria-pressed="false">Failed</button>
+                <button type="button" class="run-chip" data-status="stopped" aria-pressed="false">Stopped</button>
+                <button type="button" class="run-chip" data-status="interrupted" aria-pressed="false">Interrupted</button>
+              </div>
+              <div class="runs-summary" id="runsSummary" role="status" aria-live="polite"></div>
+              <div class="runs-list" id="runsList">
+                <div class="pane-empty">No previous runs yet.</div>
+              </div>
+              <button type="button" class="btn-ghost runs-more hidden" id="runsMore">Load more</button>
+            </div>
+            <div class="run-detail hidden" id="runDetail"></div>
+          </div>
+        </div>
       </div>
     </section>
   </div>
 
   <!-- Model settings modal -->
   <div class="modal-overlay hidden" id="modelModal">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modelModalTitle">
       <header class="modal-header">
-        <h2>Models</h2>
+        <h2 id="modelModalTitle">Models</h2>
         <button class="btn-icon" id="modalClose" title="Close" aria-label="Close model settings"><svg class="ic"><use href="#i-x"/></svg></button>
       </header>
       <div class="modal-body">
-        <div class="model-list" id="modelList">
+        <div class="model-list" id="modelList" role="radiogroup" aria-label="Available models">
           <div class="pane-empty">Loading models...</div>
         </div>
 
         <div class="form-head" id="formHead">Add a model</div>
         <form id="modelForm">
           <div class="form-row">
-            <select id="fPreset"></select>
+            <select id="fPreset" aria-label="Provider preset"></select>
           </div>
           <div class="form-grid">
             <label>Label<input type="text" id="fLabel" placeholder="My model" required /></label>
@@ -242,9 +275,9 @@
 
   <!-- MCP servers modal -->
   <div class="modal-overlay hidden" id="mcpModal">
-    <div class="modal">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcpModalTitle">
       <header class="modal-header">
-        <h2>MCP servers</h2>
+        <h2 id="mcpModalTitle">MCP servers</h2>
         <button class="btn-icon" id="mcpModalClose" title="Close" aria-label="Close MCP servers"><svg class="ic"><use href="#i-x"/></svg></button>
       </header>
       <div class="modal-body">

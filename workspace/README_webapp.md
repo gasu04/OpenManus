@@ -65,12 +65,30 @@ real time.
   model hot-swaps into live agents and applies to new sessions. Keys are
   stored in `workspace/webapp_models.json` (gitignored), only ever shown as
   a hint, and never logged.
-- **Task history** — the clock icon in the chat header opens a drawer listing
-  past tasks (first prompt, age, running indicator). Click to switch back
-  (the full conversation is replayed from the server's event log); hover to
-  delete. History lives in memory, so it clears on server restart.
-- **Multi-turn** — the agent (and its memory) persists across turns in a
-  session; follow-up prompts continue the same conversation.
+- **Previous Runs** — a dedicated tab lists every persisted run (each turn
+  of a session is its own run) with status, date, duration, action/step counts,
+  token usage, a final-answer preview, and produced files. Filter by status
+  chips, sort (newest, oldest, longest, most tokens), group by day, search
+  titles/prompts/answers on the server, and "Load more" through long lists.
+  A summary bar shows the match count, success rate, and token total; a badge
+  on the tab counts all runs and a dot shows when one is in progress.
+- **Run detail & replay** — select a run for its prompt, final answer, files,
+  and a paged **event inspector** (type filter, per-event copy, screenshots).
+  **Open replay** renders the run through the real Live / Terminal / Editor /
+  Browser panes, read-only, with an *Exit replay* banner. **Open session**
+  shows the whole session as a read-only chat.
+- **Run actions** — *Re-run this prompt* (new session, prompt prefilled, never
+  auto-sent), *Continue from this run* (new session seeded with the prompt and
+  answer as plain text — the agent's state is **not** restored), copy prompt /
+  answer, export as Markdown or JSON, and delete the session (confirmed).
+  Runs are deep-linkable as `#run=<session>/<run>`; going back restores scroll
+  position and focus. The clock icon in the header opens this tab.
+- **Disk-backed history** — sessions, run metadata, and events persist under
+  `session_store/` inside the project and survive server restarts and crashes.
+  Historical sessions reopen read-only; agent execution state is not restored.
+- **Multi-turn** — the live agent (and its memory) persists across turns in a
+  session while the server is running; follow-up prompts continue the same
+  conversation. A restored historical session cannot accept new turns.
 - **Refresh-safe** — events are replayed on reconnect, so reloading the page
   mid-run loses nothing.
 - **Session-based sign-in** — visiting the app shows a real login page (not
@@ -99,13 +117,98 @@ printed to the console unless you set it, see below).
 | `WEBAPP_HOST`                    | `127.0.0.1`        | Bind host — never change to `0.0.0.0`; put a tunnel in front instead |
 | `WEBAPP_PORT`                    | `8000`             | Bind port                                       |
 | `WEBAPP_MAX_STEPS`               | `30`               | Agent step limit per run                        |
+| `WEBAPP_SESSION_STORE_DIR`        | `session_store/`   | Disk-backed session/run/event history directory |
+| `WEBAPP_AGENT_IDLE_MINUTES`      | `0` (off)          | Release an idle session's agent (and its MCP processes) after this long; the session stays as read-only history |
+| `WEBAPP_AGENT_IDLE_CHECK_SECONDS`| `60`               | How often idle agents are swept                 |
+| `WEBAPP_RUNS_PAGE_MAX` / `WEBAPP_EVENTS_PAGE_MAX` | `200` / `2000` | Server caps for `limit` on `/api/runs` and run-detail event pages |
 | `WEBAPP_ALLOWED_ORIGINS`         | localhost/127.0.0.1 (any port) | CSRF/WS-Origin allowlist — set explicitly to the public hostname once a tunnel is in front |
 | `WEBAPP_SESSION_IDLE_MINUTES`    | `30`               | Idle session timeout                            |
 | `WEBAPP_SESSION_ABSOLUTE_HOURS`  | `12`               | Absolute session lifetime                       |
 | `WEBAPP_COOKIE_SECURE`           | `0`                | Set to `1` once TLS is live in front (Tailscale Serve, etc.) |
+| `WEBAPP_MODELS_FILE`             | `workspace/webapp_models.json` | UI model-registry persistence path — tests redirect this to a temp file |
 
 Model APIs (all auth-protected): `GET /api/models`, `PUT /api/models`,
 `DELETE /api/models/{id}`, `POST /api/models/active`.
+
+### Persistent run history
+
+The default store is `PROJECT_ROOT/session_store/` (mode 700, gitignored); set
+`WEBAPP_SESSION_STORE_DIR` to relocate it. Plain files are the source of truth:
+
+```
+session_store/
+├── index.json             # derived, rebuildable summary used by list/search
+└── <session_id>/
+    ├── session.json       # session metadata + one record per run (atomic writes)
+    ├── events.jsonl       # append-only, chronological event envelopes
+    └── blobs/<hash>.png   # offloaded screenshots (mode 600)
+```
+
+**APIs** (all authenticated):
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/runs?limit&cursor&status&q&since&until&sort` | Paginated run list from the in-memory index (previews only) plus a `summary` over every match and `total_all` |
+| `GET /api/runs/{session}/{run}?offset&limit&types` | One full run and a page of its events (`total_events` for the filter) |
+| `GET /api/blobs/{session}/{name}` | A stored screenshot (path-confined) |
+| `GET /api/sessions` / `DELETE /api/sessions/{id}` | Session summaries / delete a session and all its files |
+| `POST /api/history/prune` `{"older_than_days": N}` | Delete old sessions; sessions with a run in flight are never deleted; returns counts only |
+| `GET /api/health/detail` | Per-component health with timestamp (store writable, free space, last error *class*, queue depth, dropped events, breaker state). The public `GET /api/health` stays minimal |
+
+**Persistence behavior**
+
+- Events are queued to a bounded per-session writer (batched appends, kept-open
+  descriptor, released when idle). Terminal events (`final_result`, `status`,
+  `error`, `run_end`) are fsynced; ordinary events are flushed to the OS after
+  each batch. Anything already handed to the OS survives a process crash
+  (SIGKILL); events still waiting in the in-memory queue at that instant
+  (typically milliseconds' worth) are lost, and a power cut can additionally
+  lose recent un-fsynced ordinary events. Only events inside a run are stored.
+- The 2,000-event in-memory replay cap never prunes disk history. A restored
+  session replays whole runs, newest first, up to that cap, and tells the client
+  how many runs are shown (`session_info.runs_shown/runs_total`); every run is
+  always reachable from Previous Runs.
+- On startup, runs left `running` become `interrupted`, with the duration taken
+  from the run's last event (not the restart time). A missing, corrupt, or stale
+  `index.json` is rebuilt from the session files (stat-only check per session).
+- Unknown future schema versions are skipped and never overwritten; unversioned
+  records are migrated in memory to the current schema.
+
+**Degraded disk (full / unmounted volume)** — a persistence failure never fails
+or cancels an agent run. Writes retry with exponential backoff plus jitter behind
+a circuit breaker (one probe when half-open). The portal shows a
+*history is not being saved* banner (`history_degraded` event), `health/detail`
+reports `degraded`, queued events wait in the bounded spill queue (overflow is
+counted in `dropped_events`), and run completions are remembered and saved on
+recovery (`history_recovered`). If the store cannot start at all, the portal
+still serves and `/api/runs` answers 503.
+
+**Privacy** — everything is redacted *before* it is written (the live stream is
+never altered): `sk-…`, `GOCSPX-…`, Google/GitHub/Slack/AWS keys, JWTs, private
+key blocks, bearer/authorization headers, and `api_key`/`token`/`password`/
+`secret` values (also by JSON key). Add patterns with
+`WEBAPP_HISTORY_REDACTION_PATTERNS='["corp-[a-z0-9]{12}"]'`. Strings over
+`WEBAPP_HISTORY_MAX_EVENT_CHARS` are truncated with a marker; screenshots are
+stored as blobs, never inline. The directory still holds your prompts and
+answers: protect it, and note the volume may not be encrypted.
+
+**Retention and tuning** (`WEBAPP_HISTORY_*`, all optional):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MAX_AGE_DAYS` / `MAX_BYTES` | off | Prune sessions by inactivity / total size (oldest first) |
+| `PRUNE_INTERVAL_MINUTES` | `60` | Background retention pass period (only if a limit is set) |
+| `MIN_FREE_MB` | `100` | Free space below which health is `unhealthy` |
+| `MAX_EVENT_CHARS` / `MAX_RECORD_CHARS` | `20000` / `200000` | Per-string caps for events / prompts+answers |
+| `MAX_BLOB_MB` | `10` | Largest stored screenshot |
+| `QUEUE_MAX` / `BATCH_MAX` | `5000` / `200` | Spill queue length / events per write |
+| `RETRY_MAX` / `META_RETRY_MAX` | `5` / `2` | Attempts for event batches / foreground metadata writes |
+| `BACKOFF_BASE_MS` / `BACKOFF_MAX_MS` | `200` / `5000` | Retry backoff |
+| `BREAKER_THRESHOLD` / `BREAKER_RESET_MS` | `3` / `2000` | Failures to open the circuit / wait before one probe |
+| `FLUSH_TIMEOUT_MS` / `WRITER_IDLE_SECONDS` | `3000` / `30` | Reader wait for queued events / idle writer shutdown |
+
+Restored sessions are always read-only and reject new runs; deleting a session
+stops its run, closes its writer, and removes its whole directory.
 
 ### MCP servers panel
 
@@ -181,6 +284,10 @@ Other endpoints: `GET /api/outputs`, `GET /api/download?path=`,
 ```
 workspace/
 ├── webapp.py           FastAPI backend: auth, static, file APIs, WS sessions
+├── session_store.py    Run-history store: index, writer queue, retention, health
+├── history_config.py   Typed WEBAPP_HISTORY_* settings
+├── history_redaction.py Secret redaction, size caps, screenshot offloading
+├── history_resilience.py Circuit breaker + backoff for the store
 └── static/
     ├── index.html      Two-pane layout (chat + computer)
     ├── style.css       Manus-style light theme
