@@ -210,17 +210,32 @@ answers: protect it, and note the volume may not be encrypted.
 Restored sessions are always read-only and reject new runs; deleting a session
 stops its run, closes its writer, and removes its whole directory.
 
-### MCP servers panel
+### Connectors tab (MCP servers and skills)
 
-The plug icon (header) opens the **MCP servers** modal: every server from
-`config/mcp.json` plus the built-in Browser Use entry, each with a short
-description, a live status line (disabled / connects on next run / N tools
-live in M sessions) and a toggle switch. Toggling persists to
-`config/mcp.json` (`enabled` flag) and hot-applies to every live agent
-session — disabling removes the server's tools immediately, enabling
-reconnects without a new run or restart.
-MCP APIs (all auth-protected): `GET /api/mcp/servers`,
-`POST /api/mcp/servers/{id}/toggle` with body `{"enabled": true|false}`.
+The plug icon (header) opens the **Connectors** tab. It lists every server from
+`config/mcp.json` plus the built-in Browser Use entry, followed by installed
+agent skills. Search and All / On / Off / Risky filters work across both lists.
+Each row has a description, live status and toggle. Toggling a server persists
+to `config/mcp.json` (`enabled` flag) and hot-applies to every live agent
+session — disabling removes the server's tools immediately, enabling reconnects
+without a new run or restart. Enabling the risky `rea` server requires explicit
+confirmation; cancelling leaves it off.
+
+Skill toggles persist to the gitignored `config/skills_state.json` and rebuild
+the compact prompt index on every live agent. Disabled skills are hidden from
+`skills list` and the prompt, and `skills read` rejects them. New agents read
+the same state when created. A missing file means all skills are enabled;
+an unreadable or malformed existing file raises an error rather than silently
+re-enabling skills. `workspace/skills/connectors.json` maps skills to
+related MCP server IDs; the UI offers a link and an optional enable action, but
+never silently couples their states. Set `OPENMANUS_SKILLS_STATE_FILE` to move
+the state file (the webapp also accepts `WEBAPP_SKILLS_STATE_FILE`, primarily
+for isolated test deployments).
+
+APIs (all auth-protected, with mutating Origin/CSRF checks):
+`GET /api/mcp/servers`, `POST /api/mcp/servers/{id}/toggle`,
+`GET /api/skills`, and `POST /api/skills/{name}/toggle`. Toggle bodies are
+`{"enabled": true|false}`.
 
 `config/mcp.json` entries support these optional fields beyond
 `type`/`command`/`args`/`url`:
@@ -236,7 +251,7 @@ MCP APIs (all auth-protected): `GET /api/mcp/servers`,
 
 An optional `rea` entry registers [`morluto/rea`](https://github.com/morluto/rea)
 (`rea-agents` 6.8.0, 229 tools) **disabled by default**. Toggle it on in the MCP
-panel only for reverse-engineering tasks; the full catalog has significant
+tab only for reverse-engineering tasks; the full catalog has significant
 context cost. Its skill is vendored under
 `workspace/skills/reverse-engineer-anything/` and loads on demand through the
 generic `skills` tool. Installation, Node-version requirements, and the
@@ -275,7 +290,7 @@ package). One-time setup (~10 min):
    Continue). Tokens cache to `~/.google_workspace_mcp/credentials/` and
    refresh headlessly forever after. Terminal alternative:
    `uvx workspace-mcp --single-user --tools gmail calendar drive chat --tool-tier core`
-7. The connector is already toggled **on** in the MCP panel (`enabled` in
+7. The connector is already toggled **on** in the Connectors tab (`enabled` in
    `config/mcp.json`).
 
 ### Google Drive saving (optional)

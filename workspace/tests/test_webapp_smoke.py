@@ -128,6 +128,9 @@ class FakeManus:
             return f"Observed output: key {FAKE_KEY} and api_key=hunter2hunter2"
         return "Observed output of cmd `python_execute` executed:\n1"
 
+    def refresh_skills_prompt(self, loader):
+        self.system_prompt = loader.prompt_index()
+
     async def cleanup(self):
         pass
 
@@ -878,6 +881,195 @@ def test_mcp_toggle_hot_applies_to_live_session(server, mcp_stub):
         status, body = http("POST", "/api/mcp/servers/beta/toggle", {"enabled": True}, port=port)
         assert status == 200 and body["applied"] == 1
         assert ("connect", "beta", "http://127.0.0.1:9/sse") in stub.calls
+    finally:
+        webapp.sessions.pop(sid, None)
+
+
+# -------------------------------------------------------------- Skills API --
+@pytest.fixture
+def skills_stub(tmp_path):
+    """Redirect skill discovery, links, and state to one temporary directory."""
+    root = tmp_path / "skills"
+    skill = root / "reverse-engineer-anything"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: reverse-engineer-anything\n"
+        "description: Test reverse engineering\n---\n# Instructions\n",
+        encoding="utf-8",
+    )
+    links = root / "connectors.json"
+    links.write_text('{"reverse-engineer-anything": ["rea"]}', encoding="utf-8")
+    state = tmp_path / "skills_state.json"
+    originals = (webapp.SKILLS_ROOT, webapp.SKILLS_STATE_FILE, webapp.SKILLS_LINKS_FILE)
+    saved_sessions = dict(webapp.sessions)
+    webapp.sessions.clear()
+    webapp.SKILLS_ROOT = root
+    webapp.SKILLS_STATE_FILE = state
+    webapp.SKILLS_LINKS_FILE = links
+    try:
+        yield state
+    finally:
+        (
+            webapp.SKILLS_ROOT,
+            webapp.SKILLS_STATE_FILE,
+            webapp.SKILLS_LINKS_FILE,
+        ) = originals
+        webapp.sessions.clear()
+        webapp.sessions.update(saved_sessions)
+
+
+def test_skills_list_and_toggle_persist(server, skills_stub):
+    port = server
+    assert http("GET", "/api/skills", auth=None, port=port)[0] == 401
+    status, body = http("GET", "/api/skills", port=port)
+    assert status == 200
+    skill = body["skills"][0]
+    assert skill["id"] == "reverse-engineer-anything"
+    assert skill["enabled"] is True
+    assert skill["requires_mcp"] == ["rea"] and skill["risk"] == "high"
+
+    name = skill["id"]
+    status, body = http(
+        "POST", f"/api/skills/{name}/toggle", {"enabled": False}, port=port
+    )
+    assert status == 200 and body["enabled"] is False and body["applied"] == 0
+    assert json.loads(skills_stub.read_text())["disabled"] == [name]
+    body = http("GET", "/api/skills", port=port)[1]
+    assert body["skills"][0]["enabled"] is False
+
+    assert http(
+        "POST", f"/api/skills/{name}/toggle", {"enabled": True}, port=port
+    )[0] == 200
+    assert json.loads(skills_stub.read_text())["disabled"] == []
+    assert http(
+        "POST", "/api/skills/not-installed/toggle", {"enabled": True}, port=port
+    )[0] == 404
+
+
+def test_skills_toggle_hot_applies_to_live_session(server, skills_stub):
+    port = server
+
+    class LiveStubAgent:
+        def __init__(self):
+            self.system_prompt = ""
+
+        def refresh_skills_prompt(self, loader):
+            self.system_prompt = loader.prompt_index()
+
+    stub = LiveStubAgent()
+    sid = f"skillsstub-{uuid.uuid4().hex[:8]}"
+    session = webapp.AgentSession()
+    session.agent = stub
+    webapp.sessions[sid] = session
+    name = "reverse-engineer-anything"
+    try:
+        status, body = http(
+            "POST", f"/api/skills/{name}/toggle", {"enabled": False}, port=port
+        )
+        assert status == 200 and body["applied"] == 1
+        assert name not in stub.system_prompt
+
+        status, body = http(
+            "POST", f"/api/skills/{name}/toggle", {"enabled": True}, port=port
+        )
+        assert status == 200 and body["applied"] == 1
+        assert name in stub.system_prompt
+    finally:
+        webapp.sessions.pop(sid, None)
+
+
+@pytest.mark.asyncio
+async def test_agent_creation_refreshes_state_after_delayed_create(
+    server, skills_stub, monkeypatch
+):
+    class DelayedAgent:
+        @classmethod
+        async def create(cls):
+            await asyncio.sleep(0.05)
+            return cls()
+
+        def refresh_skills_prompt(self, loader):
+            self.system_prompt = loader.prompt_index()
+
+    monkeypatch.setattr(webapp, "Manus", DelayedAgent)
+    monkeypatch.setattr(webapp, "_apply_llm_to_agent", lambda agent: None)
+    session = webapp.AgentSession()
+    monkeypatch.setattr(session, "_instrument", lambda agent: None)
+    name = "reverse-engineer-anything"
+
+    creating = asyncio.create_task(session._ensure_agent())
+    await asyncio.sleep(0.01)
+    webapp.set_skill_enabled(webapp.SKILLS_STATE_FILE, name, False)
+    agent = await creating
+
+    assert session.agent is agent
+    assert name not in agent.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_agent_creation_cleans_up_when_skills_state_is_invalid(
+    server, skills_stub, monkeypatch
+):
+    class CleanableAgent:
+        cleaned = False
+
+        @classmethod
+        async def create(cls):
+            return cls()
+
+        def refresh_skills_prompt(self, loader):
+            self.system_prompt = loader.prompt_index()
+
+        async def cleanup(self):
+            type(self).cleaned = True
+
+    from app.exceptions import ToolError
+
+    monkeypatch.setattr(webapp, "Manus", CleanableAgent)
+    session = webapp.AgentSession()
+    webapp.SKILLS_STATE_FILE.write_text("not json", encoding="utf-8")
+
+    with pytest.raises(ToolError, match="Could not read skills state"):
+        await session._ensure_agent()
+
+    assert CleanableAgent.cleaned is True
+    assert session.agent is None
+
+
+def test_skills_toggle_save_error_returns_500(server, skills_stub, monkeypatch):
+    from app.exceptions import ToolError
+
+    def fail_save(*args):
+        raise ToolError("disk unavailable")
+
+    monkeypatch.setattr(webapp, "set_skill_enabled", fail_save)
+    status, body = http(
+        "POST",
+        "/api/skills/reverse-engineer-anything/toggle",
+        {"enabled": False},
+        port=server,
+    )
+    assert status == 500 and body["detail"] == "Could not save skills state"
+
+
+def test_skills_toggle_reports_live_refresh_errors(server, skills_stub):
+    class BrokenStubAgent:
+        def refresh_skills_prompt(self, loader):
+            raise RuntimeError("refresh failed")
+
+    sid = f"skillsbroken-{uuid.uuid4().hex[:8]}"
+    session = webapp.AgentSession()
+    session.agent = BrokenStubAgent()
+    webapp.sessions[sid] = session
+    try:
+        status, body = http(
+            "POST",
+            "/api/skills/reverse-engineer-anything/toggle",
+            {"enabled": False},
+            port=server,
+        )
+        assert status == 200 and body["applied"] == 0
+        assert body["errors"] == ["RuntimeError"]
     finally:
         webapp.sessions.pop(sid, None)
 

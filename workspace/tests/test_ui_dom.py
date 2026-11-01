@@ -69,6 +69,9 @@ def server():
         async def run(self, prompt):
             pass
 
+        def refresh_skills_prompt(self, loader):
+            self.system_prompt = loader.prompt_index()
+
         async def cleanup(self):
             pass
 
@@ -166,11 +169,23 @@ def test_p1_tablist_aria_contract(page):
     page, _ = page
     expect(page.locator("#tabs")).to_have_attribute("role", "tablist")
     tabs = page.locator("#tabs [role=tab]")
-    assert tabs.count() == 6
+    assert tabs.count() == 7
     expect(tabs.first).to_have_attribute("aria-selected", "true")
-    assert page.locator("[role=tabpanel]").count() == 6
-    for label in ["btnHistory", "btnSettings", "btnNew", "btnTheme", "zoomIn", "zoomOut"]:
+    assert page.locator("[role=tabpanel]").count() == 7
+    for label in ["btnHistory", "btnMcp", "btnSettings", "btnNew", "btnTheme", "btnSend", "btnStop", "modelChip", "zoomIn", "zoomOut"]:
         assert page.locator(f"#{label}").get_attribute("aria-label"), f"#{label} missing aria-label"
+
+
+def test_tab_arrow_keys_wrap_without_changing_active_tab(page):
+    page, _ = page
+    active = page.evaluate("() => window.__om.state.activeTab")
+    page.locator("#tab-runs").focus()
+    page.keyboard.press("ArrowRight")
+    expect(page.locator("#tab-live")).to_be_focused()
+    assert page.evaluate("() => window.__om.state.activeTab") == active
+    page.keyboard.press("ArrowLeft")
+    expect(page.locator("#tab-runs")).to_be_focused()
+    assert page.evaluate("() => window.__om.state.activeTab") == active
 
 
 def test_p1_reconnect_banner_appears_on_drop(page):
@@ -635,7 +650,7 @@ def test_session_window_note_history_banner_tab_badge_and_live_dot(page):
     assert int(badge.inner_text()) >= 1
 
 
-# ------------------------------------------------------------- MCP modal --
+# --------------------------------------------------------- Connectors tab --
 _MCP_STUB = {
     "mcpServers": {
         "alpha": {
@@ -645,6 +660,13 @@ _MCP_STUB = {
             "description": "Alpha test server",
         },
         "beta": {"type": "sse", "url": "http://127.0.0.1:9/sse", "enabled": False},
+        "rea": {
+            "type": "stdio",
+            "command": "node",
+            "args": ["rea.mjs", "mcp"],
+            "enabled": False,
+            "description": "Reverse engineering test server",
+        },
     }
 }
 
@@ -661,6 +683,17 @@ def mcp_stub(tmp_path_factory):
 
     temp = tmp_path_factory.mktemp("mcpdom") / "mcp.json"
     temp.write_text(json.dumps(_MCP_STUB))
+    skills_root = temp.parent / "skills"
+    skill = skills_root / "reverse-engineer-anything"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: reverse-engineer-anything\n"
+        "description: Test reverse engineering\n---\n# Instructions\n",
+        encoding="utf-8",
+    )
+    links = skills_root / "connectors.json"
+    links.write_text('{"reverse-engineer-anything": ["rea"]}', encoding="utf-8")
+    state = temp.parent / "skills_state.json"
 
     class _FakeMCPSettings:
         @classmethod
@@ -682,48 +715,182 @@ def mcp_stub(tmp_path_factory):
     orig_path = webapp.MCP_CONFIG_PATH
     orig_settings = webapp.MCPSettings
     orig_servers = dict(webapp.config.mcp_config.servers)
+    orig_skill_paths = (webapp.SKILLS_ROOT, webapp.SKILLS_STATE_FILE, webapp.SKILLS_LINKS_FILE)
     webapp.MCP_CONFIG_PATH = temp
     webapp.MCPSettings = _FakeMCPSettings
+    webapp.SKILLS_ROOT = skills_root
+    webapp.SKILLS_STATE_FILE = state
+    webapp.SKILLS_LINKS_FILE = links
     webapp._reload_mcp_servers()
     try:
         yield temp
     finally:
         webapp.MCP_CONFIG_PATH = orig_path
         webapp.MCPSettings = orig_settings
+        (
+            webapp.SKILLS_ROOT,
+            webapp.SKILLS_STATE_FILE,
+            webapp.SKILLS_LINKS_FILE,
+        ) = orig_skill_paths
         webapp.config.mcp_config.servers.clear()
         webapp.config.mcp_config.servers.update(orig_servers)
 
 
-def test_mcp_modal_lists_and_toggles(page, mcp_stub):
+def test_connectors_tab_lists_and_toggles_without_losing_focus(page, mcp_stub):
     page, errors = page
     errors_before = len(errors)  # earlier tests leave known-benign console noise
     page.click("#btnMcp")
-    expect(page.locator("#mcpModal")).to_be_visible()
-    cards = page.locator(".mcp-card")
-    expect(cards).to_have_count(3)  # browser_use (built-in) + alpha + beta
+    expect(page.locator("#pane-connectors")).to_be_visible()
+    cards = page.locator("#connMcpList .mcp-card")
+    expect(cards).to_have_count(4)  # browser_use + alpha + beta + rea
+    expect(page.locator("#connSkillList .mcp-card")).to_have_count(1)
 
-    builtin = page.locator('.mcp-card[data-id="browser_use"]')
+    builtin = page.locator('#connMcpList .mcp-card[data-id="browser_use"]')
     expect(builtin.locator(".mcp-badge")).to_have_text("built-in")
     expect(builtin.locator("input")).to_be_checked()
-    expect(page.locator('.mcp-card[data-id="beta"] input')).not_to_be_checked()
-    expect(page.locator('.mcp-card[data-id="beta"]')).to_have_class(re.compile(r"\bdisabled\b"))
-    # brief description renders under the server name
-    expect(page.locator('.mcp-card[data-id="alpha"] .mcp-desc')).to_have_text("Alpha test server")
+    expect(page.locator('#connMcpList .mcp-card[data-id="beta"] input')).not_to_be_checked()
+    expect(page.locator('#connMcpList .mcp-card[data-id="beta"]')).to_have_class(re.compile(r"\bdisabled\b"))
+    expect(page.locator('#connMcpList .mcp-card[data-id="rea"] .mcp-badge.risk')).to_have_text("Runs on host")
+    expect(page.locator('#connMcpList .mcp-card[data-id="alpha"] .mcp-desc')).to_have_text("Alpha test server")
 
-    # Toggle alpha off: card re-renders disabled, toast confirms, file persists.
-    page.locator('.mcp-card[data-id="alpha"] .slider').click()
+    alpha = page.locator('#connMcpList .mcp-card[data-id="alpha"]')
+    alpha.locator(".slider").click()
     expect(page.locator(".toast").last).to_contain_text("alpha deactivated", timeout=5000)
-    expect(page.locator('.mcp-card[data-id="alpha"]')).to_have_class(re.compile(r"\bdisabled\b"))
-    expect(page.locator('.mcp-card[data-id="alpha"] .mcp-status')).to_have_text("disabled")
+    expect(alpha).to_have_class(re.compile(r"\bdisabled\b"))
+    expect(alpha.locator(".mcp-status")).to_have_text("disabled")
+    expect(alpha.locator("input")).to_be_focused()
     assert json.loads(mcp_stub.read_text())["mcpServers"]["alpha"]["enabled"] is False
 
-    # Toggle back on (leave the stub clean), then close via Escape.
-    page.locator('.mcp-card[data-id="alpha"] .slider').click()
-    expect(page.locator('.mcp-card[data-id="alpha"]')).not_to_have_class(re.compile(r"\bdisabled\b"), timeout=5000)
+    alpha.locator(".slider").click()
+    expect(alpha).not_to_have_class(re.compile(r"\bdisabled\b"), timeout=5000)
+    expect(alpha.locator("input")).to_be_focused()
     assert json.loads(mcp_stub.read_text())["mcpServers"]["alpha"]["enabled"] is True
-    page.keyboard.press("Escape")
-    expect(page.locator("#mcpModal")).to_be_hidden()
-    assert errors[errors_before:] == []  # this test added no console errors
+    assert errors[errors_before:] == []
+
+
+def test_connectors_search_and_status_filters(page, mcp_stub):
+    page, _ = page
+    page.click("#btnMcp")
+    expect(page.locator("#connMcpList .mcp-card")).to_have_count(4)
+    page.fill("#connSearch", "Alpha")
+    expect(page.locator("#connMcpList .mcp-card")).to_have_count(1)
+    expect(page.locator("#connMcpList .mcp-card")).to_have_attribute("data-id", "alpha")
+    page.get_by_role("button", name="Clear filter").first.click()
+    expect(page.locator("#connMcpList .mcp-card")).to_have_count(4)
+
+    page.locator('[data-conn-filter="off"]').click()
+    expect(page.locator("#connMcpList .mcp-card")).to_have_count(2)
+    page.locator('[data-conn-filter="risky"]').click()
+    expect(page.locator("#connMcpList .mcp-card")).to_have_count(1)
+    expect(page.locator("#connSkillList .mcp-card")).to_have_count(1)
+    page.locator('[data-conn-filter=""]').click()
+
+
+def test_connectors_load_failure_clears_skeleton_and_retries(page, mcp_stub):
+    page, _ = page
+    page.route(
+        "**/api/skills",
+        lambda route: route.fulfill(
+            status=200, content_type="application/json", body="not json"
+        ),
+    )
+    page.reload(wait_until="networkidle")
+    page.wait_for_function("() => window.__om && window.__om.state.ws?.readyState === 1")
+    page.click("#btnMcp")
+    expect(page.locator("#connError .fetch-error")).to_be_visible()
+    expect(page.locator("#pane-connectors .conn-skeleton")).to_have_count(0)
+
+    page.unroute("**/api/skills")
+    page.click("#connRetry")
+    expect(page.locator("#connSkillList .mcp-card")).to_have_count(1)
+    expect(page.locator("#connError .fetch-error")).to_have_count(0)
+
+
+def test_connectors_delayed_toggle_blocks_refresh_and_reconciles(page, mcp_stub):
+    page, _ = page
+    page.click("#btnMcp")
+    alpha = page.locator('#connMcpList .mcp-card[data-id="alpha"]')
+    expect(alpha).to_be_visible()
+    page.evaluate(
+        """() => {
+          const original = window.fetch.bind(window);
+          window.__raceOriginalFetch = original;
+          window.__raceRefreshCount = 0;
+          window.__raceRelease = null;
+          window.fetch = (input, init) => {
+            const url = String(input);
+            if (url.includes('/api/mcp/servers/alpha/toggle')) {
+              return new Promise((resolve, reject) => {
+                window.__raceRelease = () => original(input, init).then(resolve, reject);
+              });
+            }
+            if (url.endsWith('/api/mcp/servers')) window.__raceRefreshCount += 1;
+            return original(input, init);
+          };
+        }"""
+    )
+    alpha.locator(".slider").click()
+    page.wait_for_function("() => Boolean(window.__raceRelease)")
+    expect(page.locator("#connRefresh")).to_be_disabled()
+    page.evaluate("() => window.__om.loadConnectors()")
+    assert page.evaluate("() => window.__raceRefreshCount") == 0
+
+    page.evaluate("() => window.__raceRelease()")
+    expect(alpha.locator(".mcp-status")).to_have_text("disabled", timeout=5000)
+    page.evaluate(
+        """() => {
+          window.fetch = window.__raceOriginalFetch;
+          delete window.__raceOriginalFetch;
+          delete window.__raceRelease;
+        }"""
+    )
+    expect(page.locator("#connRefresh")).to_be_enabled()
+    alpha.locator(".slider").click()
+    expect(alpha.locator(".mcp-status")).to_contain_text("Applied to", timeout=5000)
+
+
+def test_rea_enable_requires_confirmation_and_cancel_reverts(page, mcp_stub):
+    page, _ = page
+    page.click("#btnMcp")
+    rea = page.locator('#connMcpList .mcp-card[data-id="rea"]')
+    expect(rea).to_be_visible()
+    rea.locator(".slider").click()
+    dialog = page.get_by_role("alertdialog", name="Enable REA connector")
+    expect(dialog).to_be_visible()
+    expect(dialog).to_contain_text("70k tokens")
+    expect(rea.locator("input")).not_to_be_checked()
+    dialog.get_by_role("button", name="Cancel").click()
+    expect(dialog).to_be_hidden()
+    expect(rea.locator("input")).not_to_be_checked()
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["rea"]["enabled"] is False
+
+
+def test_skill_toggle_and_related_rea_activation(page, mcp_stub):
+    page, _ = page
+    page.click("#btnMcp")
+    skill = page.locator('#connSkillList .mcp-card[data-id="reverse-engineer-anything"]')
+    expect(skill).to_be_visible()
+    expect(skill.locator(".conn-needs")).to_have_text("Needs rea (off)")
+
+    skill.locator(".slider").click()
+    expect(skill.locator(".mcp-status")).to_have_text("disabled", timeout=5000)
+    state = mcp_stub.parent / "skills_state.json"
+    assert json.loads(state.read_text())["disabled"] == ["reverse-engineer-anything"]
+    skill.locator(".slider").click()
+    expect(skill.locator(".mcp-status")).to_contain_text("Applied to", timeout=5000)
+    expect(skill.locator("input")).to_be_checked()
+    assert json.loads(state.read_text())["disabled"] == []
+
+    skill.get_by_role("button", name="Turn on rea").click()
+    dialog = page.get_by_role("alertdialog", name="Enable REA connector")
+    dialog.get_by_role("button", name="Enable REA").click()
+    rea = page.locator('#connMcpList .mcp-card[data-id="rea"]')
+    expect(rea.locator("input")).to_be_checked(timeout=5000)
+    assert json.loads(mcp_stub.read_text())["mcpServers"]["rea"]["enabled"] is True
+
+    rea.locator(".slider").click()  # restore the risky connector's off state
+    expect(rea.locator("input")).not_to_be_checked(timeout=5000)
+    page.evaluate("() => window.__om.switchTab('live', true)")
 
 
 def test_model_form_fetch_populates_datalist(page, monkeypatch):
@@ -863,7 +1030,11 @@ def test_bug_tabs_scrollable_at_mobile_width(page):
     page.locator("#tab-files").scroll_into_view_if_needed()
     page.click("#tab-files")
     expect(page.locator("#pane-files")).to_be_visible()
+    page.locator("#tab-connectors").scroll_into_view_if_needed()
+    page.click("#tab-connectors")
+    expect(page.locator("#pane-connectors")).to_be_visible()
     page.set_viewport_size({"width": 1280, "height": 720})
+    page.evaluate("() => window.__om.switchTab('live', true)")
 
 
 def test_a11y_dialog_semantics_focus_trap_and_return(page):

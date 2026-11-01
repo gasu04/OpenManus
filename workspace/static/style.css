@@ -219,7 +219,10 @@ body {
   transition: border-color 0.15s, opacity 0.15s;
 }
 .mcp-card:hover { border-color: var(--border-hover); }
-.mcp-card.disabled { opacity: 0.62; }
+.mcp-card.disabled { color: var(--text-dim); }
+.mcp-card.risk { border-left: 3px solid var(--warn-strong); }
+.mcp-card.highlight { border-color: var(--info); box-shadow: 0 0 0 2px var(--info-soft); }
+.mcp-card:focus { outline: 2px solid var(--info); outline-offset: 2px; }
 .mcp-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
 .mcp-dot.on { background: var(--green); box-shadow: 0 0 6px var(--green); }
 .mcp-dot.idle { background: var(--amber); }
@@ -231,10 +234,12 @@ body {
   background: var(--raised); color: var(--text-dim);
   padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
 }
+.mcp-badge.risk { color: var(--warn-strong); background: var(--warn-soft); border-color: var(--warn-strong); }
 .mcp-desc {
   font-size: 11.5px; color: var(--text-faint);
   margin-top: 1px;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .mcp-sub {
   font-size: 11.5px; color: var(--text-dim);
@@ -242,6 +247,23 @@ body {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .mcp-status { font-size: 11px; color: var(--text-faint); margin-top: 1px; }
+.mcp-status.error { color: var(--red); }
+
+#pane-connectors { overflow-y: auto; }
+#pane-connectors.active { display: block; }
+.connectors-wrap { max-width: 760px; }
+.conn-section { margin-top: 20px; }
+.conn-section h3 { font-size: 13px; font-weight: 650; margin-bottom: 8px; }
+.conn-section-note { color: var(--text-faint); font-size: 11.5px; margin: -3px 0 10px; }
+.conn-links { display: flex; align-items: center; flex-wrap: wrap; gap: 5px 8px; margin-top: 6px; }
+.conn-link { border: 0; background: none; color: var(--info); padding: 0; font: 500 11px var(--sans); cursor: pointer; }
+.conn-link:hover { text-decoration: underline; }
+.conn-link.enable { color: var(--warn-strong); }
+.conn-needs { color: var(--warn-strong); font-size: 11px; }
+.conn-retry { margin-left: 8px; }
+.conn-empty { display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 1px dashed var(--border-strong); border-radius: 10px; color: var(--text-faint); font-size: 12px; padding: 14px; }
+.conn-skeleton { height: 62px; background: linear-gradient(100deg, var(--panel) 30%, var(--raised) 50%, var(--panel) 70%); background-size: 200% 100%; animation: conn-loading 1.4s ease infinite; }
+@keyframes conn-loading { to { background-position-x: -200%; } }
 
 .switch { position: relative; display: inline-block; width: 38px; height: 22px; flex: none; }
 .switch input { opacity: 0; width: 0; height: 0; }
@@ -1189,6 +1211,8 @@ body {
   .app { flex-direction: column; }
   .chat-panel { width: 100%; min-width: 0; height: 52vh; border-right: none; border-bottom: 1px solid var(--border); }
   .computer-panel { height: 48vh; }
+  .tabs { mask-image: linear-gradient(to right, transparent, #000 14px, #000 calc(100% - 14px), transparent); }
+  .switch::after { content: ""; position: absolute; inset: -11px -3px; }
   .editor-sidebar { width: 150px; }
   /* UX-005: 18vh top margin clipped the welcome hero inside the 52vh panel */
   .welcome { margin-top: 4vh; }

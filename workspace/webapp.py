@@ -86,9 +86,11 @@ from app.agent.manus import (
     _browser_use_env,
 )
 from app.config import LLMSettings, MCPSettings, config
+from app.exceptions import ToolError
 from app.llm import LLM
 from app.logger import logger
 from app.schema import ToolCall
+from app.tool.skills import SkillsTool, set_skill_enabled
 from workspace.history_config import HistoryConfig
 from workspace.session_store import SessionStore, SessionStoreError, StoreIOError
 
@@ -1828,7 +1830,15 @@ async def list_provider_models(
 # to live agent sessions - same pattern as the model hot-swap above)
 # ---------------------------------------------------------------------------
 MCP_CONFIG_PATH = PROJECT_ROOT / "config" / "mcp.json"
+SKILLS_ROOT = config.skills_root
+SKILLS_STATE_FILE = Path(
+    os.environ.get("WEBAPP_SKILLS_STATE_FILE", config.skills_state_file)
+).expanduser()
+SKILLS_LINKS_FILE = Path(
+    os.environ.get("WEBAPP_SKILLS_LINKS_FILE", SKILLS_ROOT / "connectors.json")
+).expanduser()
 _mcp_toggle_lock = asyncio.Lock()
+_skills_toggle_lock = asyncio.Lock()
 
 # Redact anything that looks like an inline credential before echoing a
 # server's command line to the UI (§2.4: mcp.json args may carry KEY=value).
@@ -1870,9 +1880,46 @@ _MCP_DESCRIPTIONS: Dict[str, str] = {
 }
 
 
+def _skills_tool() -> SkillsTool:
+    """Build a loader using the web app's redirectable local paths."""
+    return SkillsTool(root=SKILLS_ROOT, state_file=SKILLS_STATE_FILE)
+
+
+def _load_skill_links() -> Dict[str, List[str]]:
+    """Read the committed skill-to-MCP map, tolerating local file errors."""
+    try:
+        data = json.loads(SKILLS_LINKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        skill: [server for server in servers if isinstance(server, str)]
+        for skill, servers in data.items()
+        if isinstance(skill, str) and isinstance(servers, list)
+    }
+
+
+def _skill_entries() -> List[Dict[str, Any]]:
+    """Return portal-safe skill metadata, dependencies, and risk labels."""
+    links = _load_skill_links()
+    entries = []
+    for skill in _skills_tool().installed_skills():
+        requires = links.get(skill["id"], [])
+        entries.append(
+            {
+                **skill,
+                "requires_mcp": requires,
+                "risk": "high" if "rea" in requires else "normal",
+            }
+        )
+    return entries
+
+
 def _mcp_server_entries() -> List[Dict[str, Any]]:
     """All known servers: the built-in browser_use plus mcp.json entries."""
     servers = config.mcp_config.servers
+    skills = _skill_entries()
     browser_entry = servers.get(_BROWSER_USE_SERVER_ID)
     entries = [
         {
@@ -1886,6 +1933,12 @@ def _mcp_server_entries() -> List[Dict[str, Any]]:
             ),
             "enabled": browser_entry.enabled if browser_entry else True,
             "builtin": True,
+            "risk": "normal",
+            "skills": [
+                skill["id"]
+                for skill in skills
+                if _BROWSER_USE_SERVER_ID in skill["requires_mcp"]
+            ],
             "description": (
                 (browser_entry.description or _MCP_DESCRIPTIONS[_BROWSER_USE_SERVER_ID])
                 if browser_entry
@@ -1904,6 +1957,12 @@ def _mcp_server_entries() -> List[Dict[str, Any]]:
                 "summary": _server_summary(server_config),
                 "enabled": server_config.enabled,
                 "builtin": False,
+                "risk": "high" if server_id == "rea" else "normal",
+                "skills": [
+                    skill["id"]
+                    for skill in skills
+                    if server_id in skill["requires_mcp"]
+                ],
                 "description": server_config.description
                 or _MCP_DESCRIPTIONS.get(server_id, ""),
             }
@@ -2056,6 +2115,69 @@ async def toggle_mcp_server(
             }
         )
 
+
+@app.get("/api/skills")
+async def list_skills(username: str = Depends(require_auth)) -> JSONResponse:
+    """List installed skills with activation state and MCP dependencies."""
+    return JSONResponse({"skills": _skill_entries()})
+
+
+class SkillTogglePayload(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/skills/{skill_name}/toggle")
+async def toggle_skill(
+    skill_name: str,
+    payload: SkillTogglePayload,
+    username: str = Depends(require_auth),
+) -> JSONResponse:
+    """Persist a skill toggle and refresh every live agent's prompt index.
+
+    Disabled skills are rejected by ``SkillsTool`` as well as hidden from the
+    prompt, so a stale in-flight prompt cannot re-enable access by name.
+    """
+    async with _skills_toggle_lock:
+        installed = {skill["id"] for skill in _skill_entries()}
+        if skill_name not in installed:
+            raise HTTPException(status_code=404, detail="Unknown skill")
+        try:
+            set_skill_enabled(SKILLS_STATE_FILE, skill_name, payload.enabled)
+        except ToolError as exc:
+            logger.warning(f"Skills state save failed: {type(exc).__name__}")
+            raise HTTPException(
+                status_code=500, detail="Could not save skills state"
+            ) from exc
+
+        loader = _skills_tool()
+        applied, errors = 0, []
+        for session in sessions.values():
+            agent = session.agent
+            if agent is None:
+                continue
+            try:
+                refresh = getattr(agent, "refresh_skills_prompt")
+                refresh(loader)
+                applied += 1
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+                logger.warning(
+                    f"Skill toggle {skill_name} failed on a live session: "
+                    f"{type(exc).__name__}"
+                )
+        logger.info(
+            f"Skill {skill_name} {'enabled' if payload.enabled else 'disabled'} "
+            f"by {username}; applied to {applied} live session(s)"
+        )
+        return JSONResponse(
+            {
+                "status": "ok",
+                "skill": skill_name,
+                "enabled": payload.enabled,
+                "applied": applied,
+                "errors": errors,
+            }
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2279,10 +2401,25 @@ class AgentSession:
     async def _ensure_agent(self) -> Manus:
         """Create and instrument the agent on first use."""
         if self.agent is None:
-            self.agent = await Manus.create()
-            self.agent.max_steps = MAX_STEPS
-            _apply_llm_to_agent(self.agent)
-            self._instrument(self.agent)
+            agent = await Manus.create()
+            # MCP initialization can await while a skill toggle lands. Refresh
+            # after that await and before publishing the agent so no session
+            # keeps the stale pre-toggle prompt or tool state.
+            try:
+                agent.refresh_skills_prompt(_skills_tool())
+            except ToolError:
+                try:
+                    await agent.cleanup()
+                except Exception as exc:  # noqa: BLE001 - best-effort teardown
+                    logger.warning(
+                        f"Agent cleanup after skills-state failure failed: "
+                        f"{type(exc).__name__}"
+                    )
+                raise
+            agent.max_steps = MAX_STEPS
+            _apply_llm_to_agent(agent)
+            self._instrument(agent)
+            self.agent = agent
         return self.agent
 
     @staticmethod

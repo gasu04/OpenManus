@@ -562,6 +562,9 @@
     if (tab === "editor") refreshFiles();   // always reload on switch
     if (tab === "files") loadOutputs();     // always reload on switch
     if (tab === "runs") loadRuns(false);   // disk-backed history on every visit
+    if (tab === "connectors") loadConnectors();
+    const activeTab = document.querySelector(`#tabs .tab[data-tab="${tab}"]`);
+    activeTab?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }
 
   function autoSwitch(cat) {
@@ -1768,13 +1771,14 @@
 
   // UX-006: styled in-app confirmation replacing native confirm() — resolves
   // true/false, traps focus (via openDialog), Escape/Cancel = false.
-  function confirmDialog(message, { danger = false, confirmLabel = "Confirm" } = {}) {
+  function confirmDialog(message, { danger = false, confirmLabel = "Confirm", ariaLabel = "Confirmation" } = {}) {
     return new Promise((resolve) => {
       const overlay = document.createElement("div");
+      const descriptionId = `confirm-text-${crypto.randomUUID()}`;
       overlay.className = "modal-overlay confirm-overlay";
       overlay.innerHTML = `
-        <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-label="Confirmation">
-          <div class="confirm-text">${esc(message)}</div>
+        <div class="modal confirm-modal" role="alertdialog" aria-modal="true" aria-label="${esc(ariaLabel)}" aria-describedby="${descriptionId}">
+          <div class="confirm-text" id="${descriptionId}">${esc(message)}</div>
           <div class="form-actions">
             <button type="button" class="btn-ghost" data-x="cancel">Cancel</button>
             <button type="button" class="btn-primary${danger ? " danger" : ""}" data-x="ok">${esc(confirmLabel)}</button>
@@ -2040,14 +2044,36 @@
   $("modalClose").onclick = () => closeDialog(modal);
   modal.addEventListener("click", (e) => { if (e.target === modal) closeDialog(modal); });
 
-  // -------------------------------------------------------- MCP servers
-  const mcpModal = $("mcpModal");
+  // -------------------------------------------------------- connectors + skills
   let mcpServers = [];
+  let agentSkills = [];
+  let connectorsLoading = false;
+  let connectorsLoaded = false;
+  const connFilters = { q: "", status: "" };
+  const connectorPending = new Set();
+
+  function connectorsBusy() {
+    return connectorsLoading || connectorPending.size > 0;
+  }
+
+  function syncConnectorControls() {
+    const busy = connectorsBusy();
+    $("connRefresh").disabled = busy;
+    document.querySelectorAll("#pane-connectors .mcp-card input, #pane-connectors .conn-link").forEach((control) => {
+      control.disabled = busy;
+    });
+  }
 
   async function fetchMcpServers() {
     const res = await fetch("/api/mcp/servers");
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return (await res.json()).servers || [];
+  }
+
+  async function fetchSkills() {
+    const res = await fetch("/api/skills");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return (await res.json()).skills || [];
   }
 
   function mcpStatusText(s) {
@@ -2059,73 +2085,327 @@
     return "enabled · connects on next run";
   }
 
-  function renderMcpServers() {
-    const list = $("mcpList");
+  function connectorStatusText(kind, item) {
+    if (kind === "mcp") return mcpStatusText(item);
+    return item.enabled ? "enabled · applies on the next agent step" : "disabled";
+  }
+
+  function connectorDotState(kind, item) {
+    if (!item.enabled) return "off";
+    return kind === "mcp" && item.connected_sessions > 0 ? "on" : "idle";
+  }
+
+  function connectorMatches(item) {
+    const q = connFilters.q.trim().toLowerCase();
+    const haystack = [item.id, item.label, item.name, item.description, item.summary, ...(item.requires_mcp || [])]
+      .filter(Boolean).join(" ").toLowerCase();
+    if (q && !haystack.includes(q)) return false;
+    if (connFilters.status === "on") return item.enabled;
+    if (connFilters.status === "off") return !item.enabled;
+    if (connFilters.status === "risky") return item.risk === "high";
+    return true;
+  }
+
+  function sortedConnectorItems(items) {
+    return [...items].sort((a, b) =>
+      Number(b.risk === "high") - Number(a.risk === "high")
+      || Number(b.enabled) - Number(a.enabled)
+      || String(a.label || a.name).localeCompare(String(b.label || b.name))
+    );
+  }
+
+  function connectorCard(kind, id) {
+    const list = $(kind === "mcp" ? "connMcpList" : "connSkillList");
+    return [...list.querySelectorAll(".mcp-card")].find((card) => card.dataset.id === id);
+  }
+
+  function updateConnectorSummary(note = "") {
+    const serversOn = mcpServers.filter((item) => item.enabled).length;
+    const skillsOn = agentSkills.filter((item) => item.enabled).length;
+    $("connStatus").textContent = note || `${serversOn} of ${mcpServers.length} servers on · ${skillsOn} of ${agentSkills.length} skills on`;
+    const badge = $("connBadge");
+    badge.textContent = String(serversOn + skillsOn);
+    badge.classList.toggle("hidden", !connectorsLoaded);
+  }
+
+  function clearConnectorFilters() {
+    connFilters.q = "";
+    connFilters.status = "";
+    $("connSearch").value = "";
+    document.querySelectorAll("[data-conn-filter]").forEach((chip) => {
+      const active = chip.dataset.connFilter === "";
+      chip.classList.toggle("active", active);
+      chip.setAttribute("aria-pressed", String(active));
+    });
+    renderConnectors();
+  }
+
+  function scrollToConnector(kind, id) {
+    let card = connectorCard(kind, id);
+    if (!card) {
+      clearConnectorFilters();
+      card = connectorCard(kind, id);
+    }
+    if (!card) return;
+    card.scrollIntoView({ block: "nearest", inline: "nearest" });
+    card.classList.add("highlight");
+    card.focus({ preventScroll: true });
+    setTimeout(() => card.classList.remove("highlight"), 1600);
+  }
+
+  function setConnectorRowStatus(card, text, isError = false, retry = null) {
+    const status = card?.querySelector(".mcp-status");
+    if (!status) return;
+    status.textContent = text;
+    status.classList.toggle("error", isError);
+    if (retry) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "btn-ghost sm conn-retry";
+      button.textContent = "Retry";
+      button.onclick = retry;
+      status.appendChild(button);
+    }
+  }
+
+  function createConnectorCard(item, kind) {
+    const label = item.label || item.name;
+    const risky = item.risk === "high";
+    const state = connectorDotState(kind, item);
+    const description = item.description || (item.id === "rea" ? "Reverse-engineering toolkit · large tool catalog · approval required" : "");
+    const card = document.createElement("div");
+    card.className = `mcp-card${item.enabled ? "" : " disabled"}${risky ? " risk" : ""}`;
+    card.dataset.id = item.id;
+    card.dataset.kind = kind;
+    card.tabIndex = -1;
+    card.innerHTML = `
+      <span class="mcp-dot ${state}" role="img" aria-label="${item.enabled ? "enabled" : "disabled"}"></span>
+      <div class="mcp-info">
+        <div class="mcp-name">${esc(label)}${item.builtin ? '<span class="mcp-badge">built-in</span>' : ""}${risky ? `<span class="mcp-badge risk" title="Large tool catalog; runtime actions require approval">${kind === "mcp" ? "Runs on host" : "Host tools"}</span>` : ""}</div>
+        ${description ? `<div class="mcp-desc" title="${esc(description)}">${esc(description)}</div>` : ""}
+        ${item.summary ? `<div class="mcp-sub" title="${esc(item.summary)}">${esc(item.summary)}</div>` : ""}
+        <div class="mcp-status">${esc(connectorStatusText(kind, item))}</div>
+      </div>
+      <label class="switch" title="${item.enabled ? "Deactivate" : "Activate"} ${esc(item.id)}">
+        <input type="checkbox" role="switch" aria-label="Toggle ${esc(item.id)}" ${item.enabled ? "checked" : ""} />
+        <span class="slider"></span>
+      </label>`;
+    const toggle = card.querySelector("input");
+    toggle.disabled = connectorsBusy();
+    toggle.onchange = () => toggleConnector(kind, item, toggle);
+
+    const links = document.createElement("div");
+    links.className = "conn-links";
+    if (kind === "skill") {
+      for (const serverId of item.requires_mcp || []) {
+        const link = document.createElement("button");
+        link.type = "button";
+        link.className = "conn-link";
+        link.disabled = connectorsBusy();
+        link.textContent = `Uses: ${serverId}`;
+        link.onclick = () => scrollToConnector("mcp", serverId);
+        links.appendChild(link);
+        const server = mcpServers.find((entry) => entry.id === serverId);
+        if (server && !server.enabled) {
+          const note = document.createElement("span");
+          note.className = "conn-needs";
+          note.textContent = `Needs ${serverId} (off)`;
+          links.appendChild(note);
+          const enable = document.createElement("button");
+          enable.type = "button";
+          enable.className = "conn-link enable";
+          enable.disabled = connectorsBusy();
+          enable.dataset.serverId = serverId;
+          enable.textContent = `Turn on ${serverId}`;
+          enable.onclick = async () => {
+            if (await toggleConnector("mcp", server, null, true)) scrollToConnector("mcp", serverId);
+          };
+          links.appendChild(enable);
+        }
+      }
+    } else {
+      for (const skillId of item.skills || []) {
+        const link = document.createElement("button");
+        link.type = "button";
+        link.className = "conn-link";
+        link.disabled = connectorsBusy();
+        link.textContent = `Skill: ${skillId}`;
+        link.onclick = () => scrollToConnector("skill", skillId);
+        links.appendChild(link);
+      }
+    }
+    if (links.childElementCount) card.querySelector(".mcp-info").appendChild(links);
+    return card;
+  }
+
+  function renderConnectorList(kind) {
+    const isMcp = kind === "mcp";
+    const list = $(isMcp ? "connMcpList" : "connSkillList");
+    const items = sortedConnectorItems((isMcp ? mcpServers : agentSkills).filter(connectorMatches));
     list.innerHTML = "";
-    if (!mcpServers.length) {
-      list.innerHTML = `<div class="pane-empty">No MCP servers configured. Add them to config/mcp.json.</div>`;
+    list.setAttribute("aria-busy", "false");
+    if (!items.length) {
+      const empty = document.createElement("div");
+      empty.className = "conn-empty";
+      empty.textContent = `No matching ${isMcp ? "servers" : "skills"}.`;
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "btn-ghost sm";
+      clear.textContent = "Clear filter";
+      clear.onclick = clearConnectorFilters;
+      empty.appendChild(clear);
+      list.appendChild(empty);
       return;
     }
-    for (const s of mcpServers) {
-      const state = !s.enabled ? "off" : s.connected_sessions > 0 ? "on" : "idle";
-      const card = document.createElement("div");
-      card.className = "mcp-card" + (s.enabled ? "" : " disabled");
-      card.dataset.id = s.id;
-      card.innerHTML = `
-        <span class="mcp-dot ${state}" aria-hidden="true"></span>
-        <div class="mcp-info">
-          <div class="mcp-name">${esc(s.label)}${s.builtin ? '<span class="mcp-badge">built-in</span>' : ""}</div>
-          ${s.description ? `<div class="mcp-desc">${esc(s.description)}</div>` : ""}
-          <div class="mcp-sub" title="${esc(s.summary)}">${esc(s.summary)}</div>
-          <div class="mcp-status">${esc(mcpStatusText(s))}</div>
-        </div>
-        <label class="switch" title="${s.enabled ? "Deactivate" : "Activate"} ${esc(s.id)}">
-          <input type="checkbox" role="switch" aria-label="Toggle ${esc(s.id)}" ${s.enabled ? "checked" : ""} />
-          <span class="slider"></span>
-        </label>`;
+    for (const item of items) list.appendChild(createConnectorCard(item, kind));
+  }
+
+  function renderConnectors() {
+    renderConnectorList("mcp");
+    renderConnectorList("skill");
+    updateConnectorSummary();
+    syncConnectorControls();
+  }
+
+  function updateConnectorCard(kind, item, result) {
+    const card = connectorCard(kind, item.id);
+    if (card) {
+      card.classList.toggle("disabled", !item.enabled);
+      const dot = card.querySelector(".mcp-dot");
+      dot.className = `mcp-dot ${connectorDotState(kind, item)}`;
+      dot.setAttribute("aria-label", item.enabled ? "enabled" : "disabled");
       const toggle = card.querySelector("input");
-      toggle.onchange = async () => {
-        const want = toggle.checked;
-        toggle.disabled = true;
-        try {
-          const res = await fetch(`/api/mcp/servers/${encodeURIComponent(s.id)}/toggle`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ enabled: want }),
-          });
-          const data = await res.json();
-          if (!res.ok) {
-            showToast(data.detail || `Could not ${want ? "activate" : "deactivate"} ${s.id}`, "error");
-          } else {
-            const warn = data.errors && data.errors.length ? ` (${data.errors.length} live-session error${data.errors.length === 1 ? "" : "s"})` : "";
-            showToast(`${s.id} ${want ? "activated" : "deactivated"}${want ? "" : " — tools removed from live sessions"}${warn}`, data.errors && data.errors.length ? "error" : "info");
-          }
-        } catch {
-          showToast("Toggle failed (server unreachable)", "error");
-        }
-        try {
-          mcpServers = await fetchMcpServers();
-        } catch { /* keep stale list */ }
-        renderMcpServers();
-      };
-      list.appendChild(card);
+      toggle.checked = item.enabled;
+      toggle.disabled = connectorsBusy();
+      const errors = result.errors || [];
+      const applied = result.applied || 0;
+      const text = item.enabled
+        ? `Applied to ${applied} live session${applied === 1 ? "" : "s"}`
+        : "disabled";
+      setConnectorRowStatus(
+        card,
+        `${text}${errors.length ? ` · ${errors.length} session error${errors.length === 1 ? "" : "s"}` : ""}`,
+        errors.length > 0,
+        errors.length ? () => toggleConnector(kind, item, connectorCard(kind, item.id)?.querySelector("input"), item.enabled) : null
+      );
     }
+    if (kind === "mcp") renderConnectorList("skill");
+    updateConnectorSummary(`${item.id} ${item.enabled ? "activated" : "deactivated"} · applied to ${result.applied || 0} live sessions`);
   }
 
-  async function openMcpModal(trigger) {
-    openDialog(mcpModal, trigger);
-    $("mcpList").innerHTML = `<div class="pane-empty">Loading servers...</div>`;
+  async function toggleConnector(kind, item, toggle, desired = null) {
+    const want = desired == null ? toggle.checked : desired;
+    const key = `${kind}:${item.id}`;
+    const restoreFocus = Boolean(toggle && document.activeElement === toggle);
+    if (connectorsBusy()) {
+      if (toggle) toggle.checked = item.enabled;
+      return false;
+    }
+    if (kind === "mcp" && item.risk === "high" && want) {
+      if (toggle) toggle.checked = false;
+      const approved = await confirmDialog(
+        "REA tools can execute targets on this host, add roughly 70k tokens per step, and require your approval for runtime operations. Enable REA only for reverse-engineering tasks.",
+        { danger: true, confirmLabel: "Enable REA", ariaLabel: "Enable REA connector" }
+      );
+      if (!approved) {
+        if (toggle) toggle.checked = item.enabled;
+        return false;
+      }
+    }
+    if (connectorsBusy()) {
+      if (toggle) toggle.checked = item.enabled;
+      return false;
+    }
+    connectorPending.add(key);
+    syncConnectorControls();
+    if (toggle) {
+      toggle.disabled = true;
+      toggle.checked = want;
+    }
+    const endpoint = kind === "mcp" ? `/api/mcp/servers/${encodeURIComponent(item.id)}/toggle` : `/api/skills/${encodeURIComponent(item.id)}/toggle`;
     try {
-      mcpServers = await fetchMcpServers();
-      renderMcpServers();
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ enabled: want }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (toggle) toggle.checked = item.enabled;
+        const message = data.detail || `Could not ${want ? "activate" : "deactivate"} ${item.id}`;
+        setConnectorRowStatus(connectorCard(kind, item.id), message, true,
+          () => toggleConnector(kind, item, connectorCard(kind, item.id)?.querySelector("input"), want));
+        showToast(message, "error");
+        return false;
+      }
+      item.enabled = want;
+      updateConnectorCard(kind, item, data);
+      const warn = data.errors?.length ? ` (${data.errors.length} live-session error${data.errors.length === 1 ? "" : "s"})` : "";
+      showToast(`${item.id} ${want ? "activated" : "deactivated"}${kind === "mcp" && !want ? " — tools removed from live sessions" : ""}${warn}`, data.errors?.length ? "error" : "info");
+      return true;
     } catch {
-      $("mcpList").innerHTML = `<div class="pane-empty">Could not load MCP servers.</div>`;
+      if (toggle) toggle.checked = item.enabled;
+      setConnectorRowStatus(connectorCard(kind, item.id), "Toggle failed · server unreachable", true,
+        () => toggleConnector(kind, item, connectorCard(kind, item.id)?.querySelector("input"), want));
+      showToast("Toggle failed (server unreachable)", "error");
+      return false;
+    } finally {
+      connectorPending.delete(key);
+      syncConnectorControls();
+      if (toggle) {
+        toggle.disabled = false;
+        if (restoreFocus && document.contains(toggle)) toggle.focus({ preventScroll: true });
+      }
     }
   }
 
-  $("btnMcp").onclick = (e) => openMcpModal(e.currentTarget);
-  $("mcpModalClose").onclick = () => closeDialog(mcpModal);
-  mcpModal.addEventListener("click", (e) => { if (e.target === mcpModal) closeDialog(mcpModal); });
+  async function loadConnectors() {
+    if (connectorsLoading || connectorPending.size) return;
+    connectorsLoading = true;
+    syncConnectorControls();
+    $("connError").innerHTML = "";
+    for (const id of ["connMcpList", "connSkillList"]) {
+      const list = $(id);
+      list.setAttribute("aria-busy", "true");
+      if (!connectorsLoaded) list.innerHTML = '<div class="mcp-card conn-skeleton" aria-hidden="true"></div><div class="mcp-card conn-skeleton" aria-hidden="true"></div>';
+    }
+    if (!connectorsLoaded) $("connStatus").textContent = "Loading connectors…";
+    try {
+      [mcpServers, agentSkills] = await Promise.all([fetchMcpServers(), fetchSkills()]);
+      connectorsLoaded = true;
+      renderConnectors();
+    } catch {
+      $("connStatus").textContent = "Could not load connectors.";
+      $("connError").innerHTML = '<div class="fetch-error"><span>Could not load connectors.</span><button type="button" class="btn-ghost sm" id="connRetry">Retry</button></div>';
+      $("connRetry").onclick = loadConnectors;
+      for (const id of ["connMcpList", "connSkillList"]) {
+        const list = $(id);
+        list.setAttribute("aria-busy", "false");
+        if (!connectorsLoaded) list.innerHTML = "";
+      }
+    } finally {
+      connectorsLoading = false;
+      syncConnectorControls();
+    }
+  }
+
+  $("connSearch").addEventListener("input", (event) => {
+    connFilters.q = event.target.value;
+    renderConnectors();
+  });
+  document.querySelectorAll("[data-conn-filter]").forEach((chip) => {
+    chip.onclick = () => {
+      connFilters.status = chip.dataset.connFilter;
+      document.querySelectorAll("[data-conn-filter]").forEach((other) => {
+        const active = other === chip;
+        other.classList.toggle("active", active);
+        other.setAttribute("aria-pressed", String(active));
+      });
+      renderConnectors();
+    };
+  });
+  $("connRefresh").onclick = loadConnectors;
+  $("btnMcp").onclick = () => switchTab("connectors", true);
 
   updateModelChip();
 
@@ -2146,26 +2426,27 @@
   $("btnTheme").onclick = () =>
     applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark");
 
-  // Keyboard support for the tab list (P1-6).
+  // Manual tab activation: arrows move focus with wrap-around; Enter/Space
+  // activates the focused native button without fetching data on every move.
   $("tabs").addEventListener("keydown", (e) => {
-    const tabsEl = [...document.querySelectorAll(".tab")];
+    const tabsEl = [...document.querySelectorAll("#tabs .tab[role=tab]")];
     const idx = tabsEl.indexOf(document.activeElement);
     if (idx === -1) return;
-    const next = e.key === "ArrowRight" ? idx + 1 : e.key === "ArrowLeft" ? idx - 1 : -1;
-    if (next >= 0 && next < tabsEl.length) {
+    let next = -1;
+    if (e.key === "ArrowRight") next = (idx + 1) % tabsEl.length;
+    if (e.key === "ArrowLeft") next = (idx - 1 + tabsEl.length) % tabsEl.length;
+    if (e.key === "Home") next = 0;
+    if (e.key === "End") next = tabsEl.length - 1;
+    if (next >= 0) {
       e.preventDefault();
       tabsEl[next].focus();
-      tabsEl[next].click();
-    } else if (e.key === "Home" && tabsEl[0]) {
-      e.preventDefault(); tabsEl[0].focus(); tabsEl[0].click();
-    } else if (e.key === "End" && tabsEl.length) {
-      e.preventDefault(); tabsEl.at(-1).focus(); tabsEl.at(-1).click();
+      tabsEl[next].scrollIntoView({ block: "nearest", inline: "nearest" });
     }
   });
 
   // Regression-test hooks (Playwright); inert in normal use.
   window.__om = {
-    state, send, submitPrompt, switchTab, setReconnecting, loadRuns, openRun, exitReplay,
+    state, send, submitPrompt, switchTab, setReconnecting, loadRuns, loadConnectors, openRun, exitReplay,
     // Test-only event dispatcher: drives the same HANDLERS a real WS message
     // would, without needing a live agent run. Inert in normal use.
     dispatch: (type, data) => HANDLERS[type]?.(data || {}),

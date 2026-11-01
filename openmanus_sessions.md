@@ -858,3 +858,19 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - `config/mcp.json` (local, engine env), `config/mcp.example.json`, `workspace/skills/README.md`, `workspace/skills/reverse-engineer-anything/OPENMANUS.md`, `workspace/README_webapp.md`, `tests/fixtures/rea_native.c` (new), `openmanus_sessions.md`; gitignored runtime under `third_party/ghidra` and `third_party/fixtures`.
 **Next session should:**
 - Enable `rea` only when needed and prefer Ghidra for decompilation / objdump for lightweight read-only inspection. Runtime Rizin commands and all target execution still require explicit human approval. Commit docs/example changes only if the operator asks.
+
+## Session: 2026-11-01 (Connectors tab and skill activation)
+**Goal:** Add a portal tab for activating/deactivating REA, other MCP servers, and agent skills, with a usability review first.
+**Completed:**
+- Ran a read-only ui-designer review and incorporated its highest-value findings: focus-preserving toggles, risky-action confirmation, mobile tab affordances, keyboard wrap-around, readable disabled rows, and explicit loading/error/empty states.
+- Replaced the MCP modal with a seventh **Connectors** tab containing searchable/filterable MCP and Skills sections, enabled-count badge, live-session feedback, REA risk badges and enable confirmation, plus non-silent skill-to-server dependency links.
+- Added authenticated `GET /api/skills` and `POST /api/skills/{name}/toggle`; state persists atomically in gitignored `config/skills_state.json`. `SkillsTool` hides disabled skills from its prompt index and `list`, and rejects `read`. New and live `Manus` agents rebuild the index from current state without a restart.
+- Added committed `workspace/skills/connectors.json` to map `reverse-engineer-anything` to `rea`. Existing MCP toggle/API and REA approval boundary remain unchanged; REA stays disabled by default.
+- Addressed the final code review: corrupt/unreadable state now raises instead of fail-open enabling; refreshed agents use the same override paths for prompt and tool enforcement; asynchronous creation refreshes again before publishing; connector refresh/toggle operations are serialized; temporary state is gitignored; failed initial loads clear skeletons. Added delayed-creation, override, race, and error-state regressions.
+- Verification: 158 Python tests passed (webapp, DOM, history, skills) and 8 Node helper tests passed. `node --check` and `git diff --check` passed. mypy reports only the 7 known pre-existing webapp findings; no new findings in the changed agent/skills modules. Production restart (PID 39552) verified local/tailnet health, the skills API, Connectors markup, and REA still disabled with zero sessions. No commit was made.
+**State left in:**
+- Implementation and documentation are live in production and complete in the working tree, awaiting any operator-requested commit/push. Real MCP/state files were not changed by tests.
+**Files changed:**
+- `app/tool/skills.py`, `app/agent/manus.py`, `app/config.py`, `workspace/webapp.py`, `workspace/static/{index.html,app.js,style.css}`, `workspace/skills/connectors.json` (new), `config/.gitignore`, `tests/tools/test_skills.py`, `workspace/tests/{test_webapp_smoke.py,test_ui_dom.py}`, `workspace/README_webapp.md`, `workspace/skills/README.md`, `openmanus_sessions.md`.
+**Next session should:**
+- Use the live Connectors tab for connector/skill activation; keep REA off except for reverse-engineering tasks. Commit/push only the feature files when explicitly asked.

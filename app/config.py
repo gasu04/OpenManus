@@ -390,6 +390,15 @@ class Config:
         ).expanduser().resolve()
 
     @property
+    def skills_state_file(self) -> Path:
+        """Get the local JSON file containing disabled skill names."""
+        return Path(
+            os.environ.get(
+                "OPENMANUS_SKILLS_STATE_FILE", PROJECT_ROOT / "config" / "skills_state.json"
+            )
+        ).expanduser().resolve()
+
+    @property
     def skills_max_chars(self) -> int:
         """Get the maximum characters returned by one skills read or index."""
         return int(os.environ.get("OPENMANUS_SKILLS_MAX_CHARS", "60000"))

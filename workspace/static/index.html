@@ -55,7 +55,7 @@
         <div class="brand">
           <svg class="brand-logo"><use href="#i-logo"/></svg>
           <span class="brand-name">OpenManus</span>
-          <button class="model-chip" id="modelChip" title="Change model">
+          <button class="model-chip" id="modelChip" title="Change model" aria-label="Change model">
             <span class="model-chip-dot"></span><span id="modelChipName">...</span>
           </button>
         </div>
@@ -67,7 +67,7 @@
           <button class="btn-icon" id="btnHistory" title="Previous runs" aria-label="Previous runs">
             <svg class="ic"><use href="#i-history"/></svg>
           </button>
-          <button class="btn-icon" id="btnMcp" title="MCP servers" aria-label="MCP servers">
+          <button class="btn-icon" id="btnMcp" title="Connectors and skills" aria-label="Connectors and skills">
             <svg class="ic"><use href="#i-plug"/></svg>
           </button>
           <button class="btn-icon" id="btnSettings" title="Model settings" aria-label="Model settings">
@@ -96,10 +96,10 @@
             <svg class="ic"><use href="#i-paperclip"/></svg>
           </button>
           <textarea id="promptInput" rows="1" placeholder="Give OpenManus a task..." aria-label="Task prompt"></textarea>
-          <button class="btn-send" id="btnSend" title="Send" disabled>
+          <button class="btn-send" id="btnSend" title="Send" aria-label="Send task" disabled>
             <svg class="ic"><use href="#i-send"/></svg>
           </button>
-          <button class="btn-stop hidden" id="btnStop" title="Stop">
+          <button class="btn-stop hidden" id="btnStop" title="Stop" aria-label="Stop current run">
             <svg class="ic"><use href="#i-stop"/></svg>
           </button>
         </div>
@@ -136,6 +136,7 @@
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-terminal" id="tab-terminal" tabindex="-1" data-tab="terminal"><svg class="ic" aria-hidden="true"><use href="#i-terminal"/></svg>Terminal</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-editor" id="tab-editor" tabindex="-1" data-tab="editor"><svg class="ic" aria-hidden="true"><use href="#i-file"/></svg>Editor</button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-files" id="tab-files" tabindex="-1" data-tab="files"><svg class="ic" aria-hidden="true"><use href="#i-download"/></svg>Files</button>
+        <button class="tab" role="tab" aria-selected="false" aria-controls="pane-connectors" id="tab-connectors" tabindex="-1" data-tab="connectors"><svg class="ic" aria-hidden="true"><use href="#i-plug"/></svg>Connectors <span class="badge hidden" id="connBadge"></span></button>
         <button class="tab" role="tab" aria-selected="false" aria-controls="pane-runs" id="tab-runs" tabindex="-1" data-tab="runs"><svg class="ic" aria-hidden="true"><use href="#i-history"/></svg>Previous Runs <span class="badge hidden" id="runsBadge"></span><span class="tab-live-dot hidden" id="runsLiveDot" title="A run is in progress"></span></button>
       </nav>
 
@@ -187,6 +188,41 @@
             <div class="files-list" id="filesList">
               <div class="pane-empty">Files the agent produces will appear here.</div>
             </div>
+          </div>
+        </div>
+
+        <!-- MCP connectors and on-demand agent skills -->
+        <div class="pane" id="pane-connectors" role="tabpanel" aria-labelledby="tab-connectors" tabindex="0">
+          <div class="runs-wrap connectors-wrap">
+            <div class="runs-head">
+              <div>
+                <h2>Connectors</h2>
+                <p>Activate MCP tools and on-demand skills for agent sessions.</p>
+              </div>
+              <button class="btn-icon" id="connRefresh" title="Refresh connectors" aria-label="Refresh connectors"><svg class="ic"><use href="#i-refresh"/></svg></button>
+            </div>
+            <div class="runs-search">
+              <svg class="ic" aria-hidden="true"><use href="#i-search"/></svg>
+              <input type="search" id="connSearch" placeholder="Search connectors and skills…" aria-label="Search connectors and skills" />
+            </div>
+            <div class="run-chips" role="group" aria-label="Filter connectors">
+              <button type="button" class="run-chip active" data-conn-filter="" aria-pressed="true">All</button>
+              <button type="button" class="run-chip" data-conn-filter="on" aria-pressed="false">On</button>
+              <button type="button" class="run-chip" data-conn-filter="off" aria-pressed="false">Off</button>
+              <button type="button" class="run-chip" data-conn-filter="risky" aria-pressed="false">Risky</button>
+            </div>
+            <div class="runs-summary" id="connStatus" role="status" aria-live="polite"></div>
+            <div id="connError"></div>
+            <section class="conn-section" aria-labelledby="connMcpTitle">
+              <h3 id="connMcpTitle">MCP servers</h3>
+              <div class="mcp-list" id="connMcpList" aria-busy="false"></div>
+            </section>
+            <section class="conn-section" aria-labelledby="connSkillsTitle">
+              <h3 id="connSkillsTitle">Skills</h3>
+              <p class="conn-section-note">Skills add instructions on demand; their related MCP servers are controlled separately.</p>
+              <div class="mcp-list" id="connSkillList" aria-busy="false"></div>
+            </section>
+            <div class="form-note">Changes apply to live sessions and persist locally. Disabled connectors are skipped by new agent sessions.</div>
           </div>
         </div>
 
@@ -269,22 +305,6 @@
           </div>
           <div class="form-note">Keys are stored in <code>workspace/webapp_models.json</code> (gitignored), shown only as a hint afterwards, and never logged.</div>
         </form>
-      </div>
-    </div>
-  </div>
-
-  <!-- MCP servers modal -->
-  <div class="modal-overlay hidden" id="mcpModal">
-    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="mcpModalTitle">
-      <header class="modal-header">
-        <h2 id="mcpModalTitle">MCP servers</h2>
-        <button class="btn-icon" id="mcpModalClose" title="Close" aria-label="Close MCP servers"><svg class="ic"><use href="#i-x"/></svg></button>
-      </header>
-      <div class="modal-body">
-        <div class="mcp-list" id="mcpList">
-          <div class="pane-empty">Loading servers...</div>
-        </div>
-        <div class="form-note">Toggling applies instantly to every live session and persists in <code>config/mcp.json</code>. Disabled servers are skipped by new agent sessions.</div>
       </div>
     </div>
   </div>

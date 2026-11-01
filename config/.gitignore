@@ -3,3 +3,6 @@ config.toml
 # local MCP server registry (may hold machine-specific commands/keys)
 mcp.json
 mcp.json.bak-*
+# local per-skill activation state
+skills_state.json
+.skills_state.json.tmp

@@ -28,6 +28,11 @@ Absolute paths, `..` traversal, symlink escapes, non-Markdown documents, and
 missing skills are rejected. Reads are size-capped. Set
 `OPENMANUS_SKILLS_DIR` to use a different directory (resolved at startup) and
 `OPENMANUS_SKILLS_MAX_CHARS` to change the per-read/index cap (default 60,000).
+The Connectors tab stores disabled names in `config/skills_state.json`
+(gitignored; override with `OPENMANUS_SKILLS_STATE_FILE`). Disabled skills are
+hidden from the prompt and `list`, and rejected by `read`; toggles rebuild live
+agents' prompt indexes without a restart. `connectors.json` maps skill directory
+names to related MCP server IDs for portal links and risk hints.
 The host preamble takes precedence over client-specific setup advice in
 third-party skills. Skills are loaded from the local filesystem only; the tool
 never installs or updates them.
@@ -54,12 +59,13 @@ clients and can modify their configuration. The OpenManus entry in
 `rea.mjs mcp` entrypoint directly. `config/mcp.example.json` contains a
 placeholders-only example.
 
-Enable REA per task in the portal's **MCP servers** panel. Enabling hot-applies
-to live agent sessions and advertises the full catalog; disabling removes it.
-The catalog is large (a live integration turn used roughly 70k input tokens in
-one step), so leaving it off for ordinary work is intentional. The skills tool
-and prompt-index code require a webapp restart after deployment; toggling the
-MCP entry itself does not.
+Enable REA per task in the portal's **Connectors** tab. Enabling requires
+confirmation, hot-applies to live agent sessions, and advertises the full
+catalog; disabling removes it. The catalog is large (a live integration turn
+used roughly 70k input tokens in one step), so leaving it off for ordinary work
+is intentional. The related skill has its own toggle; neither switch silently
+changes the other. Deploying changed Python code still requires a webapp
+restart, but normal connector and skill toggles do not.
 
 ### Safety boundary
 

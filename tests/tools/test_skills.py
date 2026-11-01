@@ -15,10 +15,18 @@ import pytest
 
 from app.agent.manus import Manus
 from app.exceptions import ToolError
-from app.tool.skills import SkillsTool
+from app.tool.skills import SkillsTool, read_disabled_skills, set_skill_enabled
 
 SKILL_NAME = "reverse-engineer-anything"
 DESCRIPTION = "Reverse engineer packaged artifacts with evidence."
+
+
+@pytest.fixture(autouse=True)
+def isolated_skills_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """Keep every test away from the operator's real activation preferences."""
+    monkeypatch.setenv(
+        "OPENMANUS_SKILLS_STATE_FILE", str(tmp_path / "skills_state.json")
+    )
 
 
 def make_skill(root: Path, name: str = SKILL_NAME, preamble: bool = True) -> Path:
@@ -163,6 +171,110 @@ async def test_skills_read_applies_an_explicit_size_limit(tmp_path: Path):
 async def test_skills_unknown_command_raises_tool_error(tmp_path: Path):
     with pytest.raises(ToolError):
         await SkillsTool(root=tmp_path).execute(command="delete")
+
+
+@pytest.mark.asyncio
+async def test_skills_disabled_skill_is_hidden_from_index_list_and_read(tmp_path: Path):
+    make_skill(tmp_path)
+    state_file = tmp_path / "state.json"
+    set_skill_enabled(state_file, SKILL_NAME, False)
+    tool = SkillsTool(root=tmp_path, state_file=state_file)
+
+    assert tool.prompt_index() == ""
+    result = await tool.execute(command="list")
+    assert result.output["skills"] == []
+    with pytest.raises(ToolError, match="disabled"):
+        await tool.execute(command="read", name=SKILL_NAME)
+
+    set_skill_enabled(state_file, SKILL_NAME, True)
+    assert SKILL_NAME in tool.prompt_index()
+    assert read_disabled_skills(state_file) == set()
+
+
+@pytest.mark.asyncio
+async def test_skills_corrupt_state_raises_instead_of_enabling(tmp_path: Path):
+    make_skill(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text("not json", encoding="utf-8")
+    tool = SkillsTool(root=tmp_path, state_file=state_file)
+
+    with pytest.raises(ToolError, match="Could not read"):
+        read_disabled_skills(state_file)
+    with pytest.raises(ToolError, match="Could not read"):
+        tool.prompt_index()
+    with pytest.raises(ToolError, match="Could not read"):
+        await tool.execute(command="list")
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [
+        '{"disabled": ["valid-skill", "../escape", 7]}',
+        '{"disabled": "valid-skill"}',
+        "[]",
+    ],
+)
+def test_skills_state_rejects_invalid_names_and_wrong_shapes(
+    tmp_path: Path, contents: str
+):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(contents, encoding="utf-8")
+    with pytest.raises(ToolError, match="Invalid skills state"):
+        read_disabled_skills(state_file)
+
+
+def test_skills_state_read_os_error_raises_tool_error(tmp_path: Path):
+    with pytest.raises(ToolError, match="Could not read"):
+        read_disabled_skills(tmp_path)
+
+
+def test_skills_state_rejects_invalid_name_and_write_errors(tmp_path: Path):
+    state_file = tmp_path / "state.json"
+    with pytest.raises(ToolError, match="Invalid skill name"):
+        set_skill_enabled(state_file, "../escape", False)
+
+    temporary = state_file.with_name(f".{state_file.name}.tmp")
+    temporary.mkdir()
+    with pytest.raises(ToolError, match="Could not save"):
+        set_skill_enabled(state_file, SKILL_NAME, False)
+
+
+def test_manus_new_instances_and_live_agents_refresh_skill_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    make_skill(tmp_path)
+    state_file = tmp_path / "state.json"
+    monkeypatch.setenv("OPENMANUS_SKILLS_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENMANUS_SKILLS_STATE_FILE", str(state_file))
+    agent = Manus()
+    assert SKILL_NAME in agent.system_prompt
+
+    set_skill_enabled(state_file, SKILL_NAME, False)
+    agent.refresh_skills_prompt()
+    assert SKILL_NAME not in agent.system_prompt
+    assert SKILL_NAME not in Manus().system_prompt
+
+    set_skill_enabled(state_file, SKILL_NAME, True)
+    agent.refresh_skills_prompt()
+    assert SKILL_NAME in agent.system_prompt
+
+
+@pytest.mark.asyncio
+async def test_manus_refresh_reconfigures_registered_skill_tool(tmp_path: Path):
+    make_skill(tmp_path)
+    override_state = tmp_path / "webapp-override.json"
+    agent = Manus()
+    registered = agent.available_tools.tool_map["skills"]
+    assert registered.state_file != override_state
+
+    set_skill_enabled(override_state, SKILL_NAME, False)
+    agent.refresh_skills_prompt(SkillsTool(root=tmp_path, state_file=override_state))
+
+    assert registered.root == tmp_path
+    assert registered.state_file == override_state
+    assert SKILL_NAME not in agent.system_prompt
+    with pytest.raises(ToolError, match="disabled"):
+        await registered.execute(command="read", name=SKILL_NAME)
 
 
 def test_manus_registers_the_skills_tool_and_compact_index():

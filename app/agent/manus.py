@@ -45,8 +45,9 @@ class Manus(ToolCallAgent):
     name: str = "Manus"
     description: str = "A versatile agent that can solve various tasks using multiple tools including MCP-based tools"
 
-    system_prompt: str = (
-        SYSTEM_PROMPT.format(directory=config.workspace_root) + SkillsTool().prompt_index()
+    system_prompt: str = Field(
+        default_factory=lambda: SYSTEM_PROMPT.format(directory=config.workspace_root)
+        + SkillsTool().prompt_index()
     )
     next_step_prompt: str = NEXT_STEP_PROMPT
 
@@ -75,6 +76,33 @@ class Manus(ToolCallAgent):
     )  # server_id -> url/command
     mcp_instruction_servers: set[str] = Field(default_factory=set, exclude=True)
     _initialized: bool = False
+
+    def refresh_skills_prompt(self, skills_tool: SkillsTool | None = None) -> None:
+        """Rebuild the on-demand skills index from current local state.
+
+        Args:
+            skills_tool: Optional loader with test- or deployment-specific paths.
+                A default loader is created when omitted.
+
+        Note:
+            The registered skills tool receives the same paths as the prompt
+            loader, so UI overrides cannot leave tool enforcement on another
+            state file. The next LLM step receives the updated system prompt;
+            in-flight model requests cannot be changed retroactively.
+
+        Example:
+            >>> Manus().refresh_skills_prompt()
+        """
+        loader = skills_tool or SkillsTool()
+        registered = self.available_tools.tool_map.get("skills")
+        if isinstance(registered, SkillsTool):
+            registered.root = loader.root
+            registered.state_file = loader.state_file
+            registered.max_chars = loader.max_chars
+        self.system_prompt = (
+            SYSTEM_PROMPT.format(directory=config.workspace_root)
+            + loader.prompt_index()
+        )
 
     @classmethod
     async def create(cls, **kwargs) -> "Manus":
