@@ -20,6 +20,11 @@ operator-controlled setup.
 - The vendored upstream skill is version 49 from `rea-agents` 6.8.0. Follow the
   connected server's actual advertised schemas; do not assume capabilities from
   newer repository documentation exist in this release.
+- Native analysis is preconfigured with Ghidra 12.1.4 + JDK 21, GNU objdump,
+  and Rizin. Prefer Ghidra for decompilation and objdump for lightweight
+  read-only inspection. Rizin commands are unrestricted and therefore remain
+  subject to the runtime approval rules below; do not use them merely to bypass
+  a provider limitation.
 
 ## Authorization and execution boundary
 

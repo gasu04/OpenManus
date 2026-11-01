@@ -844,3 +844,17 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - `app/tool/skills.py` (new), `app/agent/manus.py`, `app/config.py`, `app/tool/__init__.py`, `config/mcp.json` (local, disabled entry), `config/mcp.example.json`, `.gitignore`, `workspace/skills/` (new), `tests/tools/test_skills.py` (new), `tests/fixtures/rea_javascript/` (new), `workspace/README_webapp.md`, `openmanus_sessions.md`.
 **Next session should:**
 - Restart production with operator approval to activate the skills loader, then use the MCP panel to enable REA only for reverse-engineering tasks. Commit/push only when asked; include the vendored skill and tests, never `third_party/` or local `config/mcp.json`.
+
+## Session: 2026-11-01 (native analysis engines)
+**Goal:** Install REA's verified Ghidra/JDK pair plus GNU binutils and Rizin at no license cost.
+**Completed:**
+- Installed Homebrew `openjdk@21` 21.0.13.0.3 (native arm64), `binutils` 2.47, and `rizin` 0.9.1_2. No sudo and no Hopper/IDA/JADX installation.
+- Downloaded official `ghidra_12.1.4_PUBLIC_20260921.zip` into gitignored `third_party/ghidra` and verified its release SHA-256 (`ddac49f9…d2d4db`). The archive supplies only Windows/Linux native decompilers, so ran its official `support/gradle/gradlew buildNatives` with JDK 21; build succeeded and produced Mach-O arm64 `decompile` and `sleigh` under `build/os/mac_arm_64`.
+- Updated the existing `rea` MCP entry (still disabled) with `GHIDRA_INSTALL_DIR`, `JAVA_HOME`, `REA_ANALYSIS_PROVIDER=ghidra`, `REA_OBJDUMP_COMMAND`, and `REA_RIZIN_COMMAND`; added placeholders to `config/mcp.example.json`. Updated the REA skill preamble and docs.
+- Verification: `rea doctor --provider ghidra --json` => healthy true. Real arm64 fixture (`tests/fixtures/rea_native.c`) decompiled to `return param_1 + param_2;`. GNU objdump and Rizin CLI analyses returned successful Evidence. OpenManus MCP connection using the actual config: 229 tools, `binary_session` OK, Ghidra/objdump/Rizin visible. 16 skills tests pass.
+**State left in:**
+- Ghidra + JDK21, GNU objdump, and Rizin are ready for the next time the operator enables `rea`; no production restart is needed because only MCP env/docs changed and REA remains disabled. No commits made for this engine installation.
+**Files changed:**
+- `config/mcp.json` (local, engine env), `config/mcp.example.json`, `workspace/skills/README.md`, `workspace/skills/reverse-engineer-anything/OPENMANUS.md`, `workspace/README_webapp.md`, `tests/fixtures/rea_native.c` (new), `openmanus_sessions.md`; gitignored runtime under `third_party/ghidra` and `third_party/fixtures`.
+**Next session should:**
+- Enable `rea` only when needed and prefer Ghidra for decompilation / objdump for lightweight read-only inspection. Runtime Rizin commands and all target execution still require explicit human approval. Commit docs/example changes only if the operator asks.

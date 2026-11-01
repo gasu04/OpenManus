@@ -244,7 +244,9 @@ mandatory host/runtime-approval rules are documented in
 `workspace/skills/README.md` and that skill's `OPENMANUS.md`. Runtime tools can
 execute targets on the host and require explicit `ask_human` approval; do not
 run `rea setup` or let the agent install/repair client registrations. Native
-analysis engines are not installed by this integration.
+analysis uses Ghidra 12.1.4 + JDK 21 (including a locally built macOS arm64
+decompiler); GNU objdump and Rizin are also configured. Hopper, IDA, and JADX
+remain uninstalled.
 
 #### Google Workspace connector (Gmail, Chat, Calendar, Drive)
 

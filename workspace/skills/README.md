@@ -78,7 +78,12 @@ not a blanket authorization for runtime execution:
 - REA Evidence is per MCP connection; use `save_path` to checkpoint work that
   must survive reconnection.
 
-Native analysis engines are deferred: no Hopper, Ghidra, IDA, or JADX is
-installed by this integration. JavaScript/Electron and other built-in static
-inspectors work without them. Provider-specific prerequisites and host support
-remain subject to REA's own documentation.
+Native analysis now uses **Ghidra 12.1.4 with JDK 21**, REA's verified pairing.
+The official release is installed under `third_party/ghidra/`, and its macOS
+arm64 decompiler was built with the included official `buildNatives` task.
+`GHIDRA_INSTALL_DIR`, `JAVA_HOME`, and `REA_ANALYSIS_PROVIDER=ghidra` are set in
+the existing `rea` entry. GNU `objdump` and Rizin are also configured with
+absolute paths (`REA_OBJDUMP_COMMAND`, `REA_RIZIN_COMMAND`). Hopper, IDA, and
+JADX remain uninstalled. Runtime Rizin commands and other mutating/execution
+workflows still require the approval rules above; read-only objdump and Ghidra
+analysis do not execute the target.
