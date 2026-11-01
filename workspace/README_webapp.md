@@ -232,6 +232,20 @@ MCP APIs (all auth-protected): `GET /api/mcp/servers`,
   how API keys reach MCP servers; the file is gitignored, and env values are
   never echoed back through the API.
 
+#### REA reverse-engineering connector
+
+An optional `rea` entry registers [`morluto/rea`](https://github.com/morluto/rea)
+(`rea-agents` 6.8.0, 229 tools) **disabled by default**. Toggle it on in the MCP
+panel only for reverse-engineering tasks; the full catalog has significant
+context cost. Its skill is vendored under
+`workspace/skills/reverse-engineer-anything/` and loads on demand through the
+generic `skills` tool. Installation, Node-version requirements, and the
+mandatory host/runtime-approval rules are documented in
+`workspace/skills/README.md` and that skill's `OPENMANUS.md`. Runtime tools can
+execute targets on the host and require explicit `ask_human` approval; do not
+run `rea setup` or let the agent install/repair client registrations. Native
+analysis engines are not installed by this integration.
+
 #### Google Workspace connector (Gmail, Chat, Calendar, Drive)
 
 Ships pre-configured but **disabled** in `config/mcp.json` (server id

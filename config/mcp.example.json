@@ -1,18 +1,35 @@
 {
     "mcpServers": {
-      "server1": {
-        "type": "sse",
-        "url": "http://localhost:8000/sse"
-      },
-      "server2": {
-        "type": "stdio",
-        "command": "npx",
-        "args": ["-y", "some-mcp-server"],
-        "enabled": true,
-        "env": {
-          "SOME_API_KEY": "paste-key-here"
+        "server1": {
+            "type": "sse",
+            "url": "http://localhost:8000/sse"
         },
-        "description": "One-line human description shown in the web UI"
-      }
+        "server2": {
+            "type": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                "some-mcp-server"
+            ],
+            "enabled": true,
+            "env": {
+                "SOME_API_KEY": "paste-key-here"
+            },
+            "description": "One-line human description shown in the web UI"
+        },
+        "rea": {
+            "type": "stdio",
+            "command": "/absolute/path/to/node-v22",
+            "args": [
+                "/absolute/path/to/rea-agents/scripts/rea.mjs",
+                "mcp"
+            ],
+            "enabled": false,
+            "env": {
+                "REA_MCP_OUTPUT_SCHEMA_PROFILE": "off",
+                "REA_MCP_INPUT_SCHEMA_PROFILE": "compact"
+            },
+            "description": "Optional REA reverse-engineering server (full catalog). Keep disabled unless needed; runtime tools can execute targets on the host and require explicit approval."
+        }
     }
 }

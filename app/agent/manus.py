@@ -12,6 +12,7 @@ from app.tool import Terminate, ToolCollection
 from app.tool.ask_human import AskHuman
 from app.tool.mcp import MCPClients, MCPClientTool
 from app.tool.python_execute import PythonExecute
+from app.tool.skills import SkillsTool
 from app.tool.str_replace_editor import StrReplaceEditor
 
 
@@ -44,7 +45,9 @@ class Manus(ToolCallAgent):
     name: str = "Manus"
     description: str = "A versatile agent that can solve various tasks using multiple tools including MCP-based tools"
 
-    system_prompt: str = SYSTEM_PROMPT.format(directory=config.workspace_root)
+    system_prompt: str = (
+        SYSTEM_PROMPT.format(directory=config.workspace_root) + SkillsTool().prompt_index()
+    )
     next_step_prompt: str = NEXT_STEP_PROMPT
 
     max_observe: int = 10000
@@ -58,6 +61,7 @@ class Manus(ToolCallAgent):
         default_factory=lambda: ToolCollection(
             PythonExecute(),
             StrReplaceEditor(),
+            SkillsTool(),
             AskHuman(),
             Terminate(),
         )

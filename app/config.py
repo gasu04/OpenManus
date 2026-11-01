@@ -1,4 +1,5 @@
 import json
+import os
 import threading
 import tomllib
 from pathlib import Path
@@ -380,6 +381,18 @@ class Config:
     def root_path(self) -> Path:
         """Get the root path of the application"""
         return PROJECT_ROOT
+
+    @property
+    def skills_root(self) -> Path:
+        """Get the directory containing on-demand agent skills."""
+        return Path(
+            os.environ.get("OPENMANUS_SKILLS_DIR", WORKSPACE_ROOT / "skills")
+        ).expanduser().resolve()
+
+    @property
+    def skills_max_chars(self) -> int:
+        """Get the maximum characters returned by one skills read or index."""
+        return int(os.environ.get("OPENMANUS_SKILLS_MAX_CHARS", "60000"))
 
 
 config = Config()

@@ -215,3 +215,10 @@ cython_debug/
 
 # node
 node_modules
+
+# Local third-party runtime packages (installed MCP/REA dependencies)
+third_party/
+
+# Agent skills loaded on demand by the skills tool
+!workspace/skills/
+!workspace/skills/**
