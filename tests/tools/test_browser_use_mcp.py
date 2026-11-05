@@ -28,11 +28,11 @@ finally:
 
 class FakeSession(ClientSession):
     def __init__(self, *, instructions="", content=None):
-        self.instructions = instructions
+        self._instructions = instructions
         self.content = content or []
 
     async def initialize(self):
-        return SimpleNamespace(instructions=self.instructions)
+        return SimpleNamespace(instructions=self._instructions)
 
     async def list_tools(self):
         return ListToolsResult(
