@@ -874,3 +874,20 @@ Canonical session log for OpenManus work, per CLAUDE.md's Session Journaling req
 - `app/tool/skills.py`, `app/agent/manus.py`, `app/config.py`, `workspace/webapp.py`, `workspace/static/{index.html,app.js,style.css}`, `workspace/skills/connectors.json` (new), `config/.gitignore`, `tests/tools/test_skills.py`, `workspace/tests/{test_webapp_smoke.py,test_ui_dom.py}`, `workspace/README_webapp.md`, `workspace/skills/README.md`, `openmanus_sessions.md`.
 **Next session should:**
 - Use the live Connectors tab for connector/skill activation; keep REA off except for reverse-engineering tasks. Commit/push only the feature files when explicitly asked.
+
+## Session: 2026-11-05 (repository health check and test repair)
+**Goal:** Run a complete read-only repository health check, review PR/update status, then fix only the deterministic test failures; explicitly no PR.
+**Completed:**
+- Delegated a read-only orchestrator assessment. Git integrity passed (`git fsck --full`); `feat/manus-web-ui` was in sync with `fork/feat/manus-web-ui`, 28 commits ahead of upstream `origin/main`, 0 behind. The fork had no open PRs, and this branch had never had an open or closed PR. Local `main` had one unpushed commit. No remote or repository state was changed during the assessment.
+- Initial suite: 8 failed / 46 passed. Root causes: two stale assertions expected Python 3.10 although both tests configure `python:3.12-slim`; two `FakeSession` tests conflicted with `mcp` 2.2.0, where `ClientSession.instructions` is a read-only property. Four additional sandbox failures were initially isolation-sensitive and did not recur after the deterministic fixes.
+- Fixed the deterministic failures only: updated both sandbox version assertions to Python 3.12, and changed `FakeSession` to store its test instructions in a private `_instructions` attribute instead of assigning the inherited read-only property.
+- Targeted verification: the four formerly deterministic failures passed. Full suite: **54 passed, 6 warnings** (`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest tests/ -q`). Remaining warnings are known Pydantic v2 deprecations.
+- Health-check tooling gaps honestly recorded: `ruff`, `mypy`, `pip-audit`, `black`, `isort`, and `autoflake` were unavailable in the existing environment and were not installed.
+- Committed and pushed the test fixes to the user's fork only: `53f4303` `test: fix sandbox and MCP test failures` on `feat/manus-web-ui` (`c01715d..53f4303`). No PR was created or changed, per the operator's instruction.
+**State left in:**
+- Branch `feat/manus-web-ui` is in sync with `fork/feat/manus-web-ui`; no PR exists. Production webapp was not restarted. Pre-existing untracked operator files/reports remain untouched.
+**Files changed:**
+- `tests/sandbox/test_client.py`, `tests/sandbox/test_sandbox.py`, `tests/tools/test_browser_use_mcp.py` (committed as `53f4303`).
+- `openmanus_sessions.md`: this journal entry.
+**Next session should:**
+- No PR action unless explicitly requested. Optional deferred follow-ups: investigate intermittent sandbox test isolation, address Pydantic v3 deprecations, install/run lint and dependency-audit tooling, and decide the fate of local `main`'s one unpushed commit.
